@@ -1,7 +1,8 @@
 import os
 import json
 from datetime import datetime, date
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
+from collections import defaultdict
 from dataclasses import dataclass, asdict, field
 import pandas as pd
 import numpy as np
@@ -172,6 +173,11 @@ class SuggestionRecord:
     pending_order_qty: int = 0
     strategy_id: str = ""
     strategy_name: str = ""
+    original_qty: int = 0
+    budget_gap: int = 0
+    budget_reason: str = ""
+    allocated_cost: float = 0.0
+    estimated_cost: float = 0.0
 
 
 @dataclass
@@ -210,6 +216,31 @@ class TransferCost:
     lead_time_days: int = 1
 
 
+@dataclass
+class InboundRecord:
+    """入库流水记录"""
+    inbound_id: str
+    order_id: str
+    sku: str
+    store_id: str
+    qty: int
+    inbound_date: str
+    unit_cost: float = 0.0
+    supplier: str = ""
+    remark: str = ""
+
+
+@dataclass
+class ReviewSnapshot:
+    """复盘快照：保存 suggest 结果，用于后续对比分析"""
+    snapshot_id: str
+    snapshot_date: str
+    strategy_id: str
+    strategy_name: str
+    records: List[Dict[str, Any]] = field(default_factory=list)
+    summary: Dict[str, Any] = field(default_factory=dict)
+
+
 class DataStore:
     def __init__(self):
         self.products: Dict[str, Product] = {}
@@ -224,6 +255,8 @@ class DataStore:
         self.data_quality_issues: List[DataQualityIssue] = []
         self.purchase_orders: List[PurchaseOrder] = []
         self.transfer_costs: List[TransferCost] = []
+        self.inbound_records: List[InboundRecord] = []
+        self.review_snapshots: List[ReviewSnapshot] = []
         self.config: Dict[str, Any] = {
             "holiday_factor": 1.3,
             "default_min_order_qty": 1,
@@ -251,6 +284,8 @@ class DataStore:
             "transfer_suggestions": [asdict(s) for s in self.transfer_suggestions],
             "purchase_orders": [asdict(o) for o in self.purchase_orders],
             "transfer_costs": [asdict(c) for c in self.transfer_costs],
+            "inbound_records": [asdict(i) for i in self.inbound_records],
+            "review_snapshots": [asdict(r) for r in self.review_snapshots],
             "config": self.config,
         }
         data = _convert_numpy_types(data)
@@ -274,6 +309,8 @@ class DataStore:
         self.transfer_suggestions = [TransferSuggestion(**s) for s in data.get("transfer_suggestions", [])]
         self.purchase_orders = [PurchaseOrder(**o) for o in data.get("purchase_orders", [])]
         self.transfer_costs = [TransferCost(**c) for c in data.get("transfer_costs", [])]
+        self.inbound_records = [InboundRecord(**i) for i in data.get("inbound_records", [])]
+        self.review_snapshots = [ReviewSnapshot(**r) for r in data.get("review_snapshots", [])]
         self.config.update(data.get("config", {}))
 
     def clear_sales(self):
@@ -321,6 +358,44 @@ class DataStore:
 
     def add_transfer_cost(self, cost: TransferCost):
         self.transfer_costs.append(cost)
+
+    def add_inbound_record(self, inbound: InboundRecord):
+        self.inbound_records.append(inbound)
+
+    def get_inbound_records(self, sku: str = "", store_id: str = "") -> List[InboundRecord]:
+        result = []
+        for rec in self.inbound_records:
+            if sku and rec.sku != sku:
+                continue
+            if store_id and rec.store_id != store_id:
+                continue
+            result.append(rec)
+        result.sort(key=lambda x: x.inbound_date, reverse=True)
+        return result
+
+    def add_stock_qty(self, store_id: str, sku: str, qty: int):
+        for stock in self.stocks:
+            if stock.store_id == store_id and stock.sku == sku:
+                stock.current_stock += qty
+                return
+        self.stocks.append(StockRecord(store_id=store_id, sku=sku, current_stock=qty))
+
+    def add_review_snapshot(self, snapshot: ReviewSnapshot):
+        self.review_snapshots.append(snapshot)
+
+    def get_latest_snapshot(self) -> Optional[ReviewSnapshot]:
+        if not self.review_snapshots:
+            return None
+        sorted_snaps = sorted(self.review_snapshots, key=lambda x: x.snapshot_date, reverse=True)
+        return sorted_snaps[0]
+
+    def get_sales_by_sku_store(self, start_date: str, end_date: str) -> Dict[Tuple[str, str], int]:
+        result = defaultdict(int)
+        for sale in self.sales:
+            if sale.sale_date < start_date or sale.sale_date > end_date:
+                continue
+            result[(sale.store_id, sale.sku)] += sale.quantity
+        return dict(result)
 
     def get_transfer_cost(self, from_region: str, to_region: str) -> TransferCost:
         for cost in self.transfer_costs:

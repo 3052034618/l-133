@@ -6,7 +6,7 @@ from tabulate import tabulate
 from datetime import datetime
 from typing import List, Optional
 
-from .storage import get_store, ReplenishmentStrategy, DataQualityIssue, PurchaseOrder
+from .storage import get_store, ReplenishmentStrategy, DataQualityIssue, PurchaseOrder, InboundRecord, ReviewSnapshot
 from .forecasting import Forecaster
 from .suggestion import SuggestionEngine
 
@@ -28,9 +28,9 @@ def _read_csv_or_excel(filepath: str) -> pd.DataFrame:
 
 
 @click.group()
-@click.version_option(version="2.1.0", prog_name="retail-replenish")
+@click.version_option(version="2.2.0", prog_name="retail-replenish")
 def cli():
-    """智慧零售补货建议命令行工具 v2.1 - 批量分析门店缺货风险"""
+    """智慧零售补货建议命令行工具 v2.2 - 预算分配·执行跟踪·复盘分析"""
     pass
 
 
@@ -463,7 +463,7 @@ def order_import(filepath, append):
               help="更新订单状态")
 @click.option("--arrived-qty", type=int, default=None, help="更新已到货数量")
 def order_update(order_id, status, arrived_qty):
-    """更新采购订单状态"""
+    """更新采购订单状态，到货时自动生成入库流水并更新库存"""
     store = get_store()
 
     order = None
@@ -476,6 +476,7 @@ def order_update(order_id, status, arrived_qty):
         click.echo(f"✗ 未找到订单: {order_id}", err=True)
         sys.exit(1)
 
+    old_arrived = order.arrived_qty
     if status:
         order.status = status
         if status == "已到货":
@@ -488,9 +489,81 @@ def order_update(order_id, status, arrived_qty):
             if order.status == "已下单":
                 order.status = "部分到货"
 
+    new_arrived_qty = order.arrived_qty - old_arrived
+    if new_arrived_qty > 0:
+        inbound_id = f"IN_{datetime.now().strftime('%Y%m%d%H%M%S')}_{order_id[-4:]}"
+        today = datetime.now().strftime("%Y-%m-%d")
+        store_id = order.store_id or ""
+        inbound = InboundRecord(
+            inbound_id=inbound_id,
+            order_id=order_id,
+            sku=order.sku,
+            store_id=store_id,
+            qty=new_arrived_qty,
+            inbound_date=today,
+            unit_cost=order.unit_cost,
+            supplier=order.supplier,
+            remark=f"订单{order_id}到货，累计{order.arrived_qty}/{order.qty}",
+        )
+        store.add_inbound_record(inbound)
+        if store_id:
+            store.add_stock_qty(store_id, order.sku, new_arrived_qty)
+        click.echo(f"✓ 新增入库流水: {inbound_id}")
+        click.echo(f"  入库数量: {new_arrived_qty}件, 门店: {store_id or '未指定'}")
+
     store.save()
     click.echo(f"✓ 订单 {order_id} 已更新")
     click.echo(f"  状态: {order.status}, 已到货: {order.arrived_qty}/{order.qty}")
+
+
+@cli.group("inbound")
+def inbound_group():
+    """到货入库流水查询"""
+    pass
+
+
+@inbound_group.command("list")
+@click.option("--sku", type=str, default=None, help="按商品SKU筛选")
+@click.option("--store", "store_id", type=str, default=None, help="按门店ID筛选")
+@click.option("--limit", type=int, default=50, help="显示前N条")
+def inbound_list(sku, store_id, limit):
+    """列出入库流水记录"""
+    store = get_store()
+    try:
+        records = store.get_inbound_records(sku=sku or "", store_id=store_id or "")
+
+        if limit:
+            display_records = records[:limit]
+        else:
+            display_records = records
+
+        click.echo(f"✓ 共 {len(records)} 条入库记录")
+        if not display_records:
+            return
+
+        data = []
+        for rec in display_records:
+            product = store.products.get(rec.sku)
+            store_info = store.stores.get(rec.store_id)
+            data.append({
+                "入库单号": rec.inbound_id,
+                "关联订单": rec.order_id,
+                "商品SKU": rec.sku,
+                "商品名称": product.name if product else rec.sku,
+                "门店ID": rec.store_id,
+                "门店名称": store_info.name if store_info else rec.store_id,
+                "入库数量": rec.qty,
+                "入库日期": rec.inbound_date,
+                "单价": rec.unit_cost,
+                "供应商": rec.supplier,
+                "备注": rec.remark,
+            })
+        df = pd.DataFrame(data)
+        click.echo(tabulate(df, headers="keys", tablefmt="grid", showindex=False, floatfmt=".1f"))
+
+    except Exception as e:
+        click.echo(f"✗ 查询入库流水失败: {e}", err=True)
+        sys.exit(1)
 
 
 @order_group.command("delete")
@@ -683,8 +756,20 @@ def transfer_simulate(group_by, limit, cross_region, max_cost_ratio, show_cost):
               help="显示使用的策略名称（默认开启）")
 @click.option("--ignore-pending", is_flag=True, default=False,
               help="忽略已下单未到货的采购订单（默认纳入计算）")
+@click.option("--budget", type=float, default=0.0,
+              help="预算上限(元)，超出时按优先级压缩（默认0=不限制）")
+@click.option("--supplier", type=str, default="",
+              help="按供应商筛选补货范围（匹配绑定的供应商策略ID）")
+@click.option("--budget-category", type=str, default="",
+              help="仅对指定品类做预算分配")
+@click.option("--priority-category", type=str, multiple=True, default=[],
+              help="品类优先级，可多次指定，先指定的先分配预算")
+@click.option("--save-snapshot", is_flag=True, default=True,
+              help="保存建议结果为复盘快照（默认开启）")
 def suggest_cmd(strategy_id, risk, need_replenish, stagnant, store_id, sku,
-                category, region, limit, show_strategy, ignore_pending):
+                category, region, limit, show_strategy, ignore_pending,
+                budget, supplier, budget_category, priority_category,
+                save_snapshot):
     """输出建议补货量、缺货风险等级、滞销提示和可调拨门店，可选择策略模板"""
     store = get_store()
 
@@ -715,6 +800,30 @@ def suggest_cmd(strategy_id, risk, need_replenish, stagnant, store_id, sku,
             category=category,
             region=region,
         )
+
+        cat_priority_list = list(priority_category) if priority_category else None
+        if budget > 0 or supplier or budget_category or cat_priority_list:
+            budget_result = engine.allocate_budget(
+                suggestions,
+                budget_limit=budget,
+                supplier_filter=supplier,
+                category_filter=budget_category,
+                category_priority=cat_priority_list,
+            )
+            click.echo(f"✓ 预算分配完成: 使用{budget_result['budget_used']:.0f}/{budget_result['budget_limit']:.0f}元")
+            if budget_result['compressed_count'] > 0:
+                click.echo(f"  压缩{budget_result['compressed_count']}条，缺口{budget_result['gap_total']}件")
+            if budget_result['skipped_count'] > 0:
+                click.echo(f"  筛选排除{budget_result['skipped_count']}条")
+
+        store.suggestions = suggestions
+        store.save()
+
+        if save_snapshot:
+            used_name = engine.current_strategy
+            used_id = strategy_id or suggestions[0].strategy_id if suggestions else ""
+            snap = engine.save_review_snapshot(strategy_id=used_id, strategy_name=used_name)
+            click.echo(f"✓ 已保存复盘快照: {snap.snapshot_id}")
 
         click.echo(f"✓ 共生成 {len(suggestions)} 条补货建议")
         click.echo(f"  使用策略: {engine.current_strategy}")
@@ -747,6 +856,11 @@ def suggest_cmd(strategy_id, risk, need_replenish, stagnant, store_id, sku,
 
         columns = ["门店名称", "区域", "商品名称", "品类", "当前库存", "在途数量", "已下单未到", "安全库存",
                    "7天预测需求", "缺货风险等级", "建议补货量", "滞销提示", "可调拨门店"]
+        if "原始建议量" in df.columns:
+            col_idx = columns.index("建议补货量")
+            columns.insert(col_idx, "原始建议量")
+            columns.insert(col_idx + 2, "预算缺口(件)")
+            columns.insert(col_idx + 3, "压缩原因")
         if show_strategy:
             columns.insert(len(columns) - 1, "使用策略")
         columns.append("建议原因")
@@ -1214,6 +1328,216 @@ def data_quality_cmd(export_path, fix, severity, limit):
         sys.exit(1)
 
 
+@cli.group("review")
+def review_group():
+    """复盘分析：建议量 vs 实际执行效果对比"""
+    pass
+
+
+@review_group.group("snapshot")
+def snapshot_subgroup():
+    """复盘快照管理"""
+    pass
+
+
+@snapshot_subgroup.command("list")
+@click.option("--limit", type=int, default=20, help="显示前N条")
+def snapshot_list(limit):
+    """列出历史复盘快照"""
+    store = get_store()
+    snapshots = store.review_snapshots
+    if not snapshots:
+        click.echo("⚠ 暂无复盘快照，请先使用 suggest --save-snapshot 生成")
+        return
+    snapshots_sorted = sorted(snapshots, key=lambda x: x.snapshot_date, reverse=True)
+    display = snapshots_sorted[:limit]
+
+    click.echo(f"✓ 共 {len(snapshots)} 个复盘快照，显示前{len(display)}个")
+    data = []
+    for s in display:
+        summary = s.summary or {}
+        data.append({
+            "快照ID": s.snapshot_id,
+            "快照日期": s.snapshot_date,
+            "策略ID": s.strategy_id,
+            "策略名称": s.strategy_name,
+            "建议明细数": summary.get("total_records", len(s.records)),
+            "需补货SKU数": summary.get("need_replenish_count", 0),
+            "总建议量(件)": summary.get("total_suggested_qty", 0),
+            "高风险数": summary.get("high_risk_count", 0),
+            "总预计成本(元)": summary.get("total_estimated_cost", 0),
+        })
+    df = pd.DataFrame(data)
+    click.echo(tabulate(df, headers="keys", tablefmt="grid", showindex=False, floatfmt=".0f"))
+
+
+@snapshot_subgroup.command("show")
+@click.option("--snapshot-id", "snapshot_id", type=str, default=None, help="指定快照ID（默认取最新）")
+def snapshot_show(snapshot_id):
+    """查看某个复盘快照的明细"""
+    store = get_store()
+    if snapshot_id:
+        snap = None
+        for s in store.review_snapshots:
+            if s.snapshot_id == snapshot_id:
+                snap = s
+                break
+    else:
+        snap = store.get_latest_snapshot()
+
+    if not snap:
+        click.echo("✗ 未找到快照", err=True)
+        sys.exit(1)
+
+    click.echo(f"=== 快照详情: {snap.snapshot_id} ===")
+    click.echo(f"快照日期: {snap.snapshot_date}")
+    click.echo(f"使用策略: {snap.strategy_id} - {snap.strategy_name}")
+    click.echo("")
+    if snap.summary:
+        click.echo("=== 汇总统计 ===")
+        for k, v in snap.summary.items():
+            click.echo(f"  {k}: {v}")
+    click.echo("")
+    if snap.records:
+        click.echo(f"=== 建议明细（前20条，共{len(snap.records)}条） ===")
+        df = pd.DataFrame(snap.records[:20])
+        click.echo(tabulate(df, headers="keys", tablefmt="grid", showindex=False, floatfmt=".0f"))
+
+
+@review_group.command("analysis")
+@click.option("--snapshot-id", "snapshot_id", type=str, default=None, help="指定快照ID（默认取最新）")
+@click.option("--detail", is_flag=True, default=False, help="显示逐行明细")
+def review_analysis(snapshot_id, detail):
+    """运行复盘分析：建议量 vs 实际下单/到货/销量"""
+    store = get_store()
+    engine = SuggestionEngine(store)
+    try:
+        if snapshot_id:
+            snap = None
+            for s in store.review_snapshots:
+                if s.snapshot_id == snapshot_id:
+                    snap = s
+                    break
+        else:
+            snap = store.get_latest_snapshot()
+        if not snap:
+            click.echo("✗ 未找到复盘快照，请先使用 suggest 生成建议并保存快照", err=True)
+            sys.exit(1)
+
+        result = engine.generate_review_analysis(snapshot=snap)
+        summary = result["summary"]
+        records = result["records"]
+
+        click.echo(f"=== 复盘分析报告 ===")
+        click.echo(f"快照ID: {snap.snapshot_id}")
+        click.echo(f"快照日期: {snap.snapshot_date}")
+        click.echo(f"分析周期: {snap.snapshot_date} 之后的实际执行数据")
+        click.echo("")
+        click.echo("=== 核心指标 ===")
+        metrics_data = [
+            {"指标": "复盘建议条数", "数值": summary.get("复盘记录数", 0)},
+            {"指标": "建议需补货SKU数", "数值": summary.get("需补货SKU数", 0)},
+            {"指标": "总建议补货量(件)", "数值": summary.get("建议补货总件数", 0)},
+            {"指标": "实际下单总数量(件)", "数值": summary.get("实际下单总件数", 0)},
+            {"指标": "实际到货总数量(件)", "数值": summary.get("实际到货总件数", 0)},
+            {"指标": "后续实际总销量(件)", "数值": summary.get("后续实际销量", 0)},
+            {"指标": "", "数值": ""},
+            {"指标": "下单命中率(≥80%建议量)", "数值": f"{summary.get('下单命中率%', 0):.1f}%"},
+            {"指标": "到货完成率", "数值": f"{(summary.get('实际到货总件数', 0) / summary.get('实际下单总件数', 1) * 100) if summary.get('实际下单总件数', 0) > 0 else 0:.1f}%"},
+            {"指标": "", "数值": ""},
+            {"指标": "建议前高风险数", "数值": snap.summary.get("risk_high", 0) if snap and snap.summary else 0},
+            {"指标": "建议前高风险→现非高风险", "数值": summary.get("高风险改善数", 0)},
+            {"指标": "建议前非高风险→现高风险", "数值": summary.get("高风险新增数", 0)},
+            {"指标": "缺货改善率", "数值": f"{summary.get('缺货改善率%', 0):.1f}%"},
+            {"指标": "", "数值": ""},
+            {"指标": "建议判定滞销SKU数", "数值": snap.summary.get("stagnant_count", 0) if snap and snap.summary else 0},
+            {"指标": "滞销品实际下单数(警告)", "数值": summary.get("滞销转积压数", 0)},
+            {"指标": "滞销转积压数", "数值": summary.get("滞销转积压数", 0)},
+        ]
+        metrics_df = pd.DataFrame(metrics_data)
+        click.echo(tabulate(metrics_df, headers="keys", tablefmt="grid", showindex=False))
+
+        if detail:
+            click.echo("")
+            click.echo(f"=== 逐行明细（前{min(50, len(records))}条） ===")
+            disp_records = records[:50]
+            df = pd.DataFrame(disp_records)
+            col_order = []
+            for c in ["门店ID", "门店名称", "商品SKU", "商品名称", "品类",
+                      "建议前风险", "当前风险",
+                      "建议量", "原始建议量", "实际下单", "实际到货", "后续实际销量",
+                      "下单命中率%", "到货完成率%",
+                      "建议前库存", "当前库存", "建议7天预测"]:
+                if c in df.columns:
+                    col_order.append(c)
+            for c in df.columns:
+                if c not in col_order:
+                    col_order.append(c)
+            click.echo(tabulate(df[col_order], headers="keys", tablefmt="grid", showindex=False, floatfmt=".0f"))
+
+        engine.last_review_analysis = result
+        engine.last_review_snapshot = snap
+        store.save()
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        click.echo(f"✗ 复盘分析失败: {e}", err=True)
+        sys.exit(1)
+
+
+@review_group.command("export")
+@click.option("--snapshot-id", "snapshot_id", type=str, default=None, help="指定快照ID（默认取最新）")
+@click.option("-o", "--output", "output", type=click.Path(), default="output/review_analysis.csv",
+              help="导出文件路径，支持 .csv 或 .xlsx")
+def review_export(snapshot_id, output):
+    """导出复盘分析结果到CSV或Excel"""
+    store = get_store()
+    engine = SuggestionEngine(store)
+    try:
+        if snapshot_id:
+            snap = None
+            for s in store.review_snapshots:
+                if s.snapshot_id == snapshot_id:
+                    snap = s
+                    break
+        else:
+            snap = store.get_latest_snapshot()
+        if not snap:
+            click.echo("✗ 未找到复盘快照", err=True)
+            sys.exit(1)
+
+        if not hasattr(engine, 'last_review_analysis') or engine.last_review_analysis is None:
+            result = engine.generate_review_analysis(snapshot=snap)
+        else:
+            result = engine.last_review_analysis
+
+        records = result["records"]
+        summary = result["summary"]
+        df = pd.DataFrame(records)
+
+        _ensure_output_dir(output)
+
+        if output.endswith(".xlsx"):
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="复盘明细", index=False)
+                summary_df = pd.DataFrame([{"指标": k, "数值": v} for k, v in summary.items()])
+                summary_df.to_excel(writer, sheet_name="汇总指标", index=False)
+        else:
+            df.to_csv(output, index=False, encoding="utf-8-sig")
+
+        click.echo(f"✓ 复盘分析结果已导出到: {output}")
+        click.echo(f"  明细条数: {len(records)}")
+        click.echo(f"  下单命中率: {summary.get('下单命中率%', 0):.1f}%")
+        click.echo(f"  缺货改善率: {summary.get('缺货改善率%', 0):.1f}%")
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        click.echo(f"✗ 导出复盘分析失败: {e}", err=True)
+        sys.exit(1)
+
+
 @cli.command("status")
 def status_cmd():
     """查看当前数据状态"""
@@ -1236,6 +1560,12 @@ def status_cmd():
         pending = sum(1 for o in store.purchase_orders if o.status in ("已下单", "部分到货"))
         pending_qty = sum(o.qty - o.arrived_qty for o in store.purchase_orders if o.status in ("已下单", "部分到货"))
         click.echo(f"  待到货: {pending} 单，{pending_qty} 件")
+    click.echo(f"入库流水: {len(store.inbound_records)} 条记录")
+    if store.inbound_records:
+        inbound_qty = sum(r.qty for r in store.inbound_records)
+        inbound_cost = sum(r.qty * r.unit_cost for r in store.inbound_records)
+        click.echo(f"  累计入库: {inbound_qty} 件，总金额 {inbound_cost:.0f} 元")
+    click.echo(f"复盘快照: {len(store.review_snapshots)} 个")
     click.echo("")
     click.echo("=== 参数配置 ===")
     for k, v in store.config.items():
