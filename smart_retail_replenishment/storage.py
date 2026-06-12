@@ -178,6 +178,10 @@ class SuggestionRecord:
     budget_reason: str = ""
     allocated_cost: float = 0.0
     estimated_cost: float = 0.0
+    budget_pool: str = ""
+    pool_used: float = 0.0
+    pool_limit: float = 0.0
+    deferred: bool = False
 
 
 @dataclass
@@ -231,10 +235,31 @@ class InboundRecord:
 
 
 @dataclass
+class TransferOrder:
+    """调拨单执行台账"""
+    transfer_id: str
+    from_store_id: str
+    to_store_id: str
+    sku: str
+    qty: int
+    status: str = "已创建"
+    created_date: str = ""
+    in_transit_date: str = ""
+    received_date: str = ""
+    received_qty: int = 0
+    unit_cost: float = 0.0
+    estimated_cost: float = 0.0
+    actual_cost: float = 0.0
+    remark: str = ""
+    source_suggestion_idx: int = -1
+
+
+@dataclass
 class ReviewSnapshot:
     """复盘快照：保存 suggest 结果，用于后续对比分析"""
     snapshot_id: str
     snapshot_date: str
+    snapshot_time: str
     strategy_id: str
     strategy_name: str
     records: List[Dict[str, Any]] = field(default_factory=list)
@@ -257,6 +282,7 @@ class DataStore:
         self.transfer_costs: List[TransferCost] = []
         self.inbound_records: List[InboundRecord] = []
         self.review_snapshots: List[ReviewSnapshot] = []
+        self.transfer_orders: List[TransferOrder] = []
         self.config: Dict[str, Any] = {
             "holiday_factor": 1.3,
             "default_min_order_qty": 1,
@@ -286,6 +312,7 @@ class DataStore:
             "transfer_costs": [asdict(c) for c in self.transfer_costs],
             "inbound_records": [asdict(i) for i in self.inbound_records],
             "review_snapshots": [asdict(r) for r in self.review_snapshots],
+            "transfer_orders": [asdict(t) for t in self.transfer_orders],
             "config": self.config,
         }
         data = _convert_numpy_types(data)
@@ -310,7 +337,12 @@ class DataStore:
         self.purchase_orders = [PurchaseOrder(**o) for o in data.get("purchase_orders", [])]
         self.transfer_costs = [TransferCost(**c) for c in data.get("transfer_costs", [])]
         self.inbound_records = [InboundRecord(**i) for i in data.get("inbound_records", [])]
-        self.review_snapshots = [ReviewSnapshot(**r) for r in data.get("review_snapshots", [])]
+        raw_snaps = data.get("review_snapshots", [])
+        for r in raw_snaps:
+            if "snapshot_time" not in r:
+                r["snapshot_time"] = r.get("snapshot_date", "")
+        self.review_snapshots = [ReviewSnapshot(**r) for r in raw_snaps]
+        self.transfer_orders = [TransferOrder(**t) for t in data.get("transfer_orders", [])]
         self.config.update(data.get("config", {}))
 
     def clear_sales(self):
@@ -328,15 +360,65 @@ class DataStore:
             del self.strategies[strategy_id]
 
     def add_purchase_order(self, order: PurchaseOrder):
-        self.purchase_orders.append(order)
+        self.upsert_purchase_order(order)
 
-    def update_purchase_order_status(self, order_id: str, status: str, arrived_qty: Optional[int] = None):
+    def upsert_purchase_order(self, order: PurchaseOrder) -> str:
+        """同订单号存在则更新原单，不存在则新增。返回 'updated' 或 'inserted'。"""
+        for idx, existing in enumerate(self.purchase_orders):
+            if existing.order_id == order.order_id:
+                old_arrived = existing.arrived_qty
+                existing.sku = order.sku or existing.sku
+                existing.store_id = order.store_id or existing.store_id
+                existing.supplier = order.supplier or existing.supplier
+                existing.unit_cost = order.unit_cost if order.unit_cost > 0 else existing.unit_cost
+                existing.ordered_date = order.ordered_date or existing.ordered_date
+                existing.expected_arrival_date = order.expected_arrival_date or existing.expected_arrival_date
+                existing.remark = order.remark or existing.remark
+                if order.qty > 0:
+                    existing.qty = order.qty
+                if order.status and order.status != existing.status:
+                    existing.status = order.status
+                    if order.status == "已到货":
+                        existing.arrived_qty = existing.qty
+                    elif order.status == "已取消":
+                        existing.arrived_qty = min(existing.arrived_qty, existing.qty)
+                        existing.qty = existing.arrived_qty
+                if order.arrived_qty is not None and order.arrived_qty > 0 and order.arrived_qty != old_arrived:
+                    existing.arrived_qty = min(order.arrived_qty, existing.qty)
+                    if existing.arrived_qty >= existing.qty and existing.status != "已取消":
+                        existing.status = "已到货"
+                    elif existing.arrived_qty > 0 and existing.status == "已下单":
+                        existing.status = "部分到货"
+                return "updated"
+        self.purchase_orders.append(order)
+        return "inserted"
+
+    def update_purchase_order_status(self, order_id: str, status: str, arrived_qty: Optional[int] = None) -> Tuple[Optional[PurchaseOrder], int]:
+        """更新PO状态并返回 (订单, 新增到货量)"""
         for order in self.purchase_orders:
             if order.order_id == order_id:
+                old_arrived = order.arrived_qty
                 order.status = status
+                if status == "已到货":
+                    order.arrived_qty = order.qty
+                elif status == "已取消":
+                    order.arrived_qty = min(order.arrived_qty, order.qty)
+                    order.qty = order.arrived_qty
                 if arrived_qty is not None:
-                    order.arrived_qty = arrived_qty
-                break
+                    order.arrived_qty = min(arrived_qty, order.qty)
+                    if order.arrived_qty >= order.qty and order.status != "已取消":
+                        order.status = "已到货"
+                    elif order.arrived_qty > 0 and order.status == "已下单":
+                        order.status = "部分到货"
+                new_arrived = order.arrived_qty - old_arrived
+                return order, new_arrived
+        return None, 0
+
+    def find_purchase_order(self, order_id: str) -> Optional[PurchaseOrder]:
+        for o in self.purchase_orders:
+            if o.order_id == order_id:
+                return o
+        return None
 
     def get_pending_orders_for_sku(self, sku: str, store_id: str = "") -> List[PurchaseOrder]:
         result = []
@@ -496,6 +578,77 @@ class DataStore:
             )
             if record.sku and record.start_date and record.end_date:
                 self.promotions.append(record)
+
+    def get_stock_by_key(self, store_id: str, sku: str) -> Optional[StockRecord]:
+        for s in self.stocks:
+            if s.store_id == store_id and s.sku == sku:
+                return s
+        return None
+
+    def add_stock_in_transit(self, store_id: str, sku: str, qty: int):
+        stock = self.get_stock_by_key(store_id, sku)
+        if stock:
+            stock.in_transit += qty
+            if stock.in_transit < 0:
+                stock.in_transit = 0
+        else:
+            self.stocks.append(StockRecord(
+                store_id=store_id, sku=sku, current_stock=0, in_transit=max(0, qty), safety_stock=0
+            ))
+
+    def add_transfer_order(self, order: TransferOrder):
+        self.transfer_orders.append(order)
+
+    def find_transfer_order(self, transfer_id: str) -> Optional[TransferOrder]:
+        for t in self.transfer_orders:
+            if t.transfer_id == transfer_id:
+                return t
+        return None
+
+    def get_transfer_orders(self, from_store: str = "", to_store: str = "", sku: str = "", status: str = "") -> List[TransferOrder]:
+        result = []
+        for t in self.transfer_orders:
+            if from_store and t.from_store_id != from_store:
+                continue
+            if to_store and t.to_store_id != to_store:
+                continue
+            if sku and t.sku != sku:
+                continue
+            if status and t.status != status:
+                continue
+            result.append(t)
+        result.sort(key=lambda x: x.created_date, reverse=True)
+        return result
+
+    def get_total_transfer_in_transit(self, sku: str, store_id: str = "") -> int:
+        total = 0
+        for t in self.transfer_orders:
+            if t.status not in ("已创建", "在途"):
+                continue
+            if t.sku != sku:
+                continue
+            pending = t.qty - t.received_qty
+            if pending <= 0:
+                continue
+            if store_id and t.to_store_id != store_id:
+                continue
+            total += pending
+        return total
+
+    def get_total_transfer_pending_out(self, sku: str, store_id: str = "") -> int:
+        total = 0
+        for t in self.transfer_orders:
+            if t.status not in ("已创建", "在途"):
+                continue
+            if t.sku != sku:
+                continue
+            pending = t.qty - t.received_qty
+            if pending <= 0:
+                continue
+            if store_id and t.from_store_id != store_id:
+                continue
+            total += pending
+        return total
 
 
 _store_instance: Optional[DataStore] = None

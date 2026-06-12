@@ -27,12 +27,17 @@ class SuggestionEngine:
     def _get_pending_order_qty(self, store_id: str, sku: str) -> int:
         if not self.include_pending_orders:
             return 0
-        return self.store.get_total_pending_qty(sku, store_id)
+        po = self.store.get_total_pending_qty(sku, store_id)
+        transfer_in = self.store.get_total_transfer_in_transit(sku, store_id)
+        transfer_out = self.store.get_total_transfer_pending_out(sku, store_id)
+        return max(0, po + transfer_in - transfer_out)
 
     def _get_available_stock(self, stock: StockRecord, store_id: str, sku: str) -> int:
         base = stock.current_stock + stock.in_transit
-        pending = self._get_pending_order_qty(store_id, sku)
-        return base + pending
+        pending_po = self.store.get_total_pending_qty(sku, store_id) if self.include_pending_orders else 0
+        transfer_in = self.store.get_total_transfer_in_transit(sku, store_id)
+        transfer_out = self.store.get_total_transfer_pending_out(sku, store_id)
+        return base + pending_po + transfer_in - transfer_out
 
     def _get_forecast_7d_map(self) -> Dict[Tuple[str, str], float]:
         result = defaultdict(float)
@@ -562,6 +567,11 @@ class SuggestionEngine:
                 row["压缩原因"] = s.budget_reason
                 row["全量预计成本(元)"] = s.estimated_cost
                 row["实际分配成本(元)"] = s.allocated_cost
+                if s.budget_pool:
+                    row["预算池"] = s.budget_pool
+                    row["预算池上限(元)"] = s.pool_limit if s.pool_limit > 0 else ""
+                    row["预算池已用(元)"] = round(s.pool_used, 2) if s.pool_used > 0 else ""
+                    row["是否延后"] = "是" if s.deferred else ""
             data.append(row)
 
         return pd.DataFrame(data)
@@ -701,7 +711,14 @@ class SuggestionEngine:
                         budget_limit: float = 0,
                         supplier_filter: str = "",
                         category_filter: str = "",
-                        category_priority: Optional[List[str]] = None) -> Dict[str, Any]:
+                        category_priority: Optional[List[str]] = None,
+                        supplier_credit_limits: Optional[Dict[str, float]] = None,
+                        category_budget_pools: Optional[Dict[str, float]] = None,
+                        store_priority_list: Optional[List[str]] = None) -> Dict[str, Any]:
+        supplier_credit_limits = supplier_credit_limits or {}
+        category_budget_pools = category_budget_pools or {}
+        store_priority_list = store_priority_list or []
+
         eligible = []
         for s in suggestions:
             product = self.store.products.get(s.sku)
@@ -709,6 +726,14 @@ class SuggestionEngine:
             if category_filter and category != category_filter:
                 continue
             eligible.append(s)
+
+        def _store_rank(s):
+            if not store_priority_list:
+                return 0
+            try:
+                return store_priority_list.index(s.store_id)
+            except ValueError:
+                return len(store_priority_list)
 
         if category_priority:
             def _category_rank(s):
@@ -718,23 +743,48 @@ class SuggestionEngine:
                     return category_priority.index(cat)
                 except ValueError:
                     return len(category_priority)
-            eligible.sort(key=lambda s: (_category_rank(s), self._get_priority_score(s)))
+            eligible.sort(key=lambda s: (
+                _store_rank(s),
+                _category_rank(s),
+                self._get_priority_score(s),
+            ))
         else:
-            eligible.sort(key=lambda s: self._get_priority_score(s))
+            eligible.sort(key=lambda s: (
+                _store_rank(s),
+                self._get_priority_score(s),
+            ))
 
-        result = {"total_cost": 0.0, "compressed_count": 0, "skipped_count": 0,
-                  "budget_used": 0.0, "budget_limit": budget_limit, "gap_total": 0}
+        pool_used: Dict[str, float] = defaultdict(float)
+        pool_deferred_qty: Dict[str, int] = defaultdict(int)
+        supplier_used: Dict[str, float] = defaultdict(float)
+        deferred_skus: List[str] = []
+
+        result = {
+            "total_cost": 0.0, "compressed_count": 0, "skipped_count": 0,
+            "budget_used": 0.0, "budget_limit": budget_limit, "gap_total": 0,
+            "deferred_count": 0, "deferred_qty_total": 0,
+            "pool_summary": {}, "supplier_summary": {},
+        }
 
         for s in eligible:
             if s.suggested_qty <= 0:
                 continue
             product = self.store.products.get(s.sku)
             unit_cost = product.unit_cost if product else 0.0
+            category = product.category if product else ""
+            sku_supplier = product.strategy_id if product else ""
+
             s.original_qty = s.suggested_qty
             s.estimated_cost = round(s.suggested_qty * unit_cost, 2)
 
+            pool_key = category or "其他"
+            pool_limit = float(category_budget_pools.get(pool_key, 0.0))
+            if pool_limit <= 0 and category_budget_pools:
+                pool_limit = 0.0
+            s.pool_limit = pool_limit
+
             if supplier_filter:
-                supplier_sku_match = (product.strategy_id == supplier_filter) if product else False
+                supplier_sku_match = (sku_supplier == supplier_filter) if sku_supplier else False
                 if not supplier_sku_match:
                     s.suggested_qty = 0
                     s.budget_gap = s.original_qty
@@ -743,60 +793,166 @@ class SuggestionEngine:
                     result["gap_total"] += s.budget_gap
                     continue
 
+            max_cost = s.estimated_cost
             if budget_limit > 0:
-                remaining_budget = budget_limit - result["budget_used"]
-                if remaining_budget <= 0:
+                remaining_global = budget_limit - result["budget_used"]
+                if remaining_global <= 0:
                     s.suggested_qty = 0
                     s.budget_gap = s.original_qty
-                    s.budget_reason = "预算不足，全量压缩"
+                    s.budget_reason = "全局预算不足，全量压缩"
                     result["compressed_count"] += 1
                     result["gap_total"] += s.budget_gap
                     continue
-                max_affordable_qty = int(remaining_budget // unit_cost) if unit_cost > 0 else s.original_qty
-                if max_affordable_qty < s.original_qty:
-                    product = self.store.products.get(s.sku)
-                    min_qty = product.min_order_qty if product else 1
-                    compressed_qty = (max_affordable_qty // min_qty) * min_qty if max_affordable_qty >= min_qty else 0
-                    gap = s.original_qty - compressed_qty
-                    if compressed_qty <= 0:
+                max_cost = min(max_cost, remaining_global)
+
+            if pool_limit > 0:
+                pool_remaining = pool_limit - pool_used[pool_key]
+                if pool_remaining <= 0:
+                    s.suggested_qty = 0
+                    s.budget_gap = s.original_qty
+                    s.budget_reason = f"品类预算池({pool_key})已用完，延后至下一批"
+                    s.deferred = True
+                    s.budget_pool = pool_key
+                    pool_deferred_qty[pool_key] += s.original_qty
+                    deferred_skus.append(s.sku)
+                    result["deferred_count"] += 1
+                    result["deferred_qty_total"] += s.original_qty
+                    result["gap_total"] += s.budget_gap
+                    continue
+                max_cost = min(max_cost, pool_remaining)
+
+            if sku_supplier and supplier_credit_limits:
+                supplier_limit = float(supplier_credit_limits.get(sku_supplier, 0.0))
+                if supplier_limit > 0:
+                    supp_remaining = supplier_limit - supplier_used[sku_supplier]
+                    if supp_remaining <= 0:
                         s.suggested_qty = 0
                         s.budget_gap = s.original_qty
-                        s.budget_reason = f"预算不足，全部压缩；剩余预算{remaining_budget:.0f}元，需{s.estimated_cost:.0f}元"
-                    else:
-                        s.suggested_qty = compressed_qty
-                        s.budget_gap = gap
-                        s.budget_reason = f"预算压缩：{s.original_qty}→{compressed_qty}件，缺口{gap}件；剩余预算{remaining_budget:.0f}元，全量需{s.estimated_cost:.0f}元"
-                    s.allocated_cost = round(s.suggested_qty * unit_cost, 2)
-                    result["budget_used"] += s.allocated_cost
-                    result["compressed_count"] += 1
-                    result["gap_total"] += s.budget_gap
-                    continue
+                        s.budget_reason = f"供应商({sku_supplier})信用额度用尽，延后至下一批"
+                        s.deferred = True
+                        s.budget_pool = pool_key
+                        pool_deferred_qty[pool_key] += s.original_qty
+                        deferred_skus.append(s.sku)
+                        result["deferred_count"] += 1
+                        result["deferred_qty_total"] += s.original_qty
+                        result["gap_total"] += s.budget_gap
+                        continue
+                    max_cost = min(max_cost, supp_remaining)
+
+            if unit_cost > 0:
+                max_affordable_qty = int(max_cost // unit_cost)
+            else:
+                max_affordable_qty = s.original_qty
+
+            if max_affordable_qty < s.original_qty:
+                min_qty = product.min_order_qty if product else 1
+                compressed_qty = (max_affordable_qty // min_qty) * min_qty if max_affordable_qty >= min_qty else 0
+                gap = s.original_qty - compressed_qty
+                if compressed_qty <= 0:
+                    s.suggested_qty = 0
+                    s.budget_gap = s.original_qty
+                    reasons = []
+                    if budget_limit > 0 and result["budget_used"] >= budget_limit - 0.01:
+                        reasons.append("全局预算不足")
+                    if pool_limit > 0 and pool_used[pool_key] >= pool_limit - 0.01:
+                        reasons.append(f"{pool_key}品类池用完")
+                    if sku_supplier and supplier_limit > 0 and supplier_used[sku_supplier] >= supplier_limit - 0.01:
+                        reasons.append(f"{sku_supplier}额度用尽")
+                    reason_text = "；".join(reasons) if reasons else "预算/额度不足"
+                    s.budget_reason = f"{reason_text}，全部压缩；剩余预算{max_cost:.0f}元，需{s.estimated_cost:.0f}元"
+                    s.deferred = True
+                    s.budget_pool = pool_key
+                    pool_deferred_qty[pool_key] += s.original_qty
+                    deferred_skus.append(s.sku)
+                    result["deferred_count"] += 1
+                    result["deferred_qty_total"] += s.original_qty
+                else:
+                    s.suggested_qty = compressed_qty
+                    s.budget_gap = gap
+                    s.budget_reason = f"预算压缩：{s.original_qty}→{compressed_qty}件，缺口{gap}件；可分配{max_cost:.0f}元，全量需{s.estimated_cost:.0f}元"
+                s.allocated_cost = round(s.suggested_qty * unit_cost, 2)
+                result["budget_used"] += s.allocated_cost
+                if pool_limit > 0:
+                    pool_used[pool_key] += s.allocated_cost
+                    s.pool_used = pool_used[pool_key]
+                if sku_supplier and supplier_credit_limits and sku_supplier in supplier_credit_limits:
+                    supplier_used[sku_supplier] += s.allocated_cost
+                s.budget_pool = pool_key
+                result["compressed_count"] += 1
+                result["gap_total"] += s.budget_gap
+                continue
+
             s.allocated_cost = s.estimated_cost
             result["budget_used"] += s.allocated_cost
+            if pool_limit > 0:
+                pool_used[pool_key] += s.allocated_cost
+                s.pool_used = pool_used[pool_key]
+            if sku_supplier and supplier_credit_limits and sku_supplier in supplier_credit_limits:
+                supplier_used[sku_supplier] += s.allocated_cost
+            s.budget_pool = pool_key
 
         result["total_cost"] = result["budget_used"]
+
+        pool_summary_out = {}
+        all_pools = set(list(category_budget_pools.keys()) + list(pool_used.keys()) + list(pool_deferred_qty.keys()))
+        for p in all_pools:
+            limit_p = float(category_budget_pools.get(p, 0.0))
+            used_p = float(pool_used.get(p, 0.0))
+            pool_summary_out[p] = {
+                "limit": limit_p,
+                "used": used_p,
+                "remaining": round(limit_p - used_p, 2) if limit_p > 0 else 0.0,
+                "deferred_qty": int(pool_deferred_qty.get(p, 0)),
+            }
+        result["pool_summary"] = pool_summary_out
+
+        supp_summary_out = {}
+        all_supps = set(list(supplier_credit_limits.keys()) + list(supplier_used.keys()))
+        for sp in all_supps:
+            limit_s = float(supplier_credit_limits.get(sp, 0.0))
+            used_s = float(supplier_used.get(sp, 0.0))
+            supp_summary_out[sp] = {
+                "limit": limit_s,
+                "used": used_s,
+                "remaining": round(limit_s - used_s, 2) if limit_s > 0 else 0.0,
+            }
+        result["supplier_summary"] = supp_summary_out
+        result["deferred_skus"] = deferred_skus
+
+        self.last_budget_allocation = result
         return result
 
     def save_review_snapshot(self, strategy_id: str = "", strategy_name: str = "") -> ReviewSnapshot:
-        snapshot_id = f"SNAP_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        snapshot_date = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now()
+        snapshot_id = f"SNAP_{now.strftime('%Y%m%d%H%M%S')}"
+        snapshot_date = now.strftime("%Y-%m-%d")
+        snapshot_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
         records = []
         risk_counts = {"高": 0, "中": 0, "低": 0}
         total_suggested = 0
+        total_original = 0
         total_need_replenish = 0
         stagnant_count = 0
         total_cost = 0.0
+        total_allocated_cost = 0.0
+        total_gap = 0
+        compressed_count = 0
+        deferred_count = 0
+        budget_used = 0.0
+        pool_tracker: Dict[str, Dict] = defaultdict(lambda: {"limit": 0.0, "used": 0.0, "deferred": 0})
 
         for s in self.store.suggestions:
             product = self.store.products.get(s.sku)
             unit_cost = product.unit_cost if product else 0.0
+            est_cost = round(s.suggested_qty * unit_cost, 2)
             records.append({
                 "store_id": s.store_id,
                 "sku": s.sku,
                 "suggested_qty": s.suggested_qty,
-                "original_qty": s.original_qty,
+                "original_qty": s.original_qty if s.original_qty > 0 else s.suggested_qty,
                 "budget_gap": s.budget_gap,
+                "budget_reason": s.budget_reason,
                 "risk_level": s.risk_level,
                 "stagnant_warning": s.stagnant_warning,
                 "forecast_7d": s.forecast_7d,
@@ -804,30 +960,61 @@ class SuggestionEngine:
                 "pending_order_qty": s.pending_order_qty,
                 "strategy_id": s.strategy_id,
                 "strategy_name": s.strategy_name,
-                "estimated_cost": round(s.suggested_qty * unit_cost, 2),
+                "estimated_cost": est_cost,
+                "allocated_cost": round(s.allocated_cost, 2) if s.allocated_cost > 0 else est_cost,
+                "budget_pool": s.budget_pool,
+                "deferred": bool(s.deferred),
             })
             risk_counts[s.risk_level] = risk_counts.get(s.risk_level, 0) + 1
             total_suggested += s.suggested_qty
+            if s.original_qty > 0:
+                total_original += s.original_qty
+            else:
+                total_original += s.suggested_qty
             if s.suggested_qty > 0:
                 total_need_replenish += 1
             if s.stagnant_warning:
                 stagnant_count += 1
-            total_cost += s.suggested_qty * unit_cost
+            if s.budget_gap > 0:
+                total_gap += s.budget_gap
+                compressed_count += 1
+            if s.deferred:
+                deferred_count += 1
+            total_cost += (s.original_qty if s.original_qty > 0 else s.suggested_qty) * unit_cost
+            total_allocated_cost += est_cost
+            if s.allocated_cost > 0:
+                budget_used += s.allocated_cost
+            else:
+                budget_used += est_cost
+            if s.budget_pool:
+                pool_tracker[s.budget_pool]["used"] += (s.allocated_cost if s.allocated_cost > 0 else est_cost)
+                pool_tracker[s.budget_pool]["limit"] = max(pool_tracker[s.budget_pool]["limit"], s.pool_limit)
+                if s.deferred:
+                    pool_tracker[s.budget_pool]["deferred"] += s.original_qty
 
         summary = {
             "total_records": len(self.store.suggestions),
             "total_suggested_qty": total_suggested,
+            "total_original_qty": total_original,
             "need_replenish_count": total_need_replenish,
             "stagnant_count": stagnant_count,
             "risk_high": risk_counts.get("高", 0),
             "risk_medium": risk_counts.get("中", 0),
             "risk_low": risk_counts.get("低", 0),
+            "compressed_count": compressed_count,
+            "deferred_count": deferred_count,
+            "budget_gap_total": total_gap,
             "total_estimated_cost": round(total_cost, 2),
+            "total_allocated_cost": round(total_allocated_cost, 2),
+            "budget_used": round(budget_used, 2),
+            "pool_summary": {k: dict(v) for k, v in pool_tracker.items()},
+            "snapshot_time": snapshot_time,
         }
 
         snap = ReviewSnapshot(
             snapshot_id=snapshot_id,
             snapshot_date=snapshot_date,
+            snapshot_time=snapshot_time,
             strategy_id=strategy_id,
             strategy_name=strategy_name,
             records=records,

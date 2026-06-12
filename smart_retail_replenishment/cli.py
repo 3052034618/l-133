@@ -6,7 +6,8 @@ from tabulate import tabulate
 from datetime import datetime
 from typing import List, Optional
 
-from .storage import get_store, ReplenishmentStrategy, DataQualityIssue, PurchaseOrder, InboundRecord, ReviewSnapshot
+from .storage import (get_store, ReplenishmentStrategy, DataQualityIssue, PurchaseOrder,
+                      InboundRecord, ReviewSnapshot, TransferOrder)
 from .forecasting import Forecaster
 from .suggestion import SuggestionEngine
 
@@ -28,9 +29,9 @@ def _read_csv_or_excel(filepath: str) -> pd.DataFrame:
 
 
 @click.group()
-@click.version_option(version="2.2.0", prog_name="retail-replenish")
+@click.version_option(version="2.3.0", prog_name="retail-replenish")
 def cli():
-    """智慧零售补货建议命令行工具 v2.2 - 预算分配·执行跟踪·复盘分析"""
+    """智慧零售补货建议命令行工具 v2.3 - 执行台账·预算池·调拨闭环·复盘优化"""
     pass
 
 
@@ -399,9 +400,9 @@ def order_list(status, sku, store_id, limit):
 
 @order_group.command("import")
 @click.argument("filepath", type=click.Path(exists=True, dir_okay=False))
-@click.option("--append/--replace", default=True, help="追加或替换（默认追加）")
+@click.option("--append/--replace", default=True, help="追加或替换（默认追加，同订单号自动更新不重复）")
 def order_import(filepath, append):
-    """导入采购订单（回填补货执行状态）
+    """导入采购订单（回填补货执行状态，同订单号自动更新不重复）
 
     FILEPATH: 订单文件，需包含列：order_id, sku, qty, status, ordered_date, expected_arrival_date, arrived_qty, store_id, remark
     """
@@ -419,6 +420,9 @@ def order_import(filepath, append):
             store.purchase_orders = []
 
         count = 0
+        updated_count = 0
+        inserted_count = 0
+        new_inbound_count = 0
         for _, row in df.iterrows():
             def _safe_str(val, default=""):
                 s = str(val) if val is not None else default
@@ -430,29 +434,80 @@ def order_import(filepath, append):
                 except (ValueError, TypeError):
                     return default
 
+            oid = _safe_str(row["order_id"])
+            sku_val = _safe_str(row["sku"])
+            qty_val = _safe_int(row.get("qty", 0))
+            status_val = _safe_str(row.get("status", "已下单")) or "已下单"
+            ordered_date = _safe_str(row.get("ordered_date", ""))
+            expected = _safe_str(row.get("expected_arrival_date", ""))
+            arrived_val = _safe_int(row.get("arrived_qty", 0))
+            unit_cost_val = float(row.get("unit_cost", 0.0) or 0)
+            supplier_val = _safe_str(row.get("supplier", ""))
+            store_id_val = _safe_str(row.get("store_id", ""))
+            remark_val = _safe_str(row.get("remark", ""))
+
+            existing = store.find_purchase_order(oid)
+            old_arrived_before = existing.arrived_qty if existing else 0
+
             order = PurchaseOrder(
-                order_id=_safe_str(row["order_id"]),
-                sku=_safe_str(row["sku"]),
-                qty=_safe_int(row.get("qty", 0)),
-                status=_safe_str(row.get("status", "已下单")) or "已下单",
-                ordered_date=_safe_str(row.get("ordered_date", "")),
-                expected_arrival_date=_safe_str(row.get("expected_arrival_date", "")),
-                arrived_qty=_safe_int(row.get("arrived_qty", 0)),
-                unit_cost=float(row.get("unit_cost", 0.0) or 0),
-                supplier=_safe_str(row.get("supplier", "")),
-                store_id=_safe_str(row.get("store_id", "")),
-                remark=_safe_str(row.get("remark", "")),
+                order_id=oid,
+                sku=sku_val,
+                qty=qty_val,
+                status=status_val,
+                ordered_date=ordered_date,
+                expected_arrival_date=expected,
+                arrived_qty=arrived_val,
+                unit_cost=unit_cost_val,
+                supplier=supplier_val,
+                store_id=store_id_val,
+                remark=remark_val,
             )
-            store.add_purchase_order(order)
+            result = store.upsert_purchase_order(order)
+            if result == "updated":
+                updated_count += 1
+            else:
+                inserted_count += 1
             count += 1
 
+            after = store.find_purchase_order(oid)
+            new_inbound_qty = 0
+            if after:
+                new_inbound_qty = max(0, after.arrived_qty - old_arrived_before)
+            if new_inbound_qty > 0:
+                inbound_id = f"IN_{datetime.now().strftime('%Y%m%d%H%M%S')}_{oid[-4:]}"
+                today = datetime.now().strftime("%Y-%m-%d")
+                inbound = InboundRecord(
+                    inbound_id=inbound_id,
+                    order_id=oid,
+                    sku=after.sku if after else sku_val,
+                    store_id=after.store_id if after else store_id_val,
+                    qty=new_inbound_qty,
+                    inbound_date=today,
+                    unit_cost=after.unit_cost if after else unit_cost_val,
+                    supplier=after.supplier if after else supplier_val,
+                    remark=f"订单{oid}导入到货，累计{after.arrived_qty}/{after.qty}",
+                )
+                store.add_inbound_record(inbound)
+                if (after.store_id if after else store_id_val):
+                    store.add_stock_qty(after.store_id if after else store_id_val,
+                                        after.sku if after else sku_val, new_inbound_qty)
+                new_inbound_count += 1
+
         store.save()
-        click.echo(f"✓ 已导入 {count} 条采购订单")
+        click.echo(f"✓ 已处理 {count} 条采购订单")
+        if inserted_count:
+            click.echo(f"  新增: {inserted_count} 条")
+        if updated_count:
+            click.echo(f"  更新: {updated_count} 条（同订单号覆盖）")
+        if new_inbound_count:
+            click.echo(f"  同步生成入库流水: {new_inbound_count} 条")
 
         pending_qty = sum(o.qty - o.arrived_qty for o in store.purchase_orders if o.status in ("已下单", "部分到货"))
-        click.echo(f"  待到货总数量: {pending_qty} 件")
+        click.echo(f"  当前待到货总数量: {pending_qty} 件")
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         click.echo(f"✗ 导入失败: {e}", err=True)
         sys.exit(1)
 
@@ -461,35 +516,27 @@ def order_import(filepath, append):
 @click.argument("order_id")
 @click.option("--status", type=click.Choice(["已下单", "部分到货", "已到货", "已取消"]), default=None,
               help="更新订单状态")
-@click.option("--arrived-qty", type=int, default=None, help="更新已到货数量")
+@click.option("--arrived-qty", type=int, default=None, help="更新已到货数量（只允许比当前值增加，以避免重复入库）")
 def order_update(order_id, status, arrived_qty):
     """更新采购订单状态，到货时自动生成入库流水并更新库存"""
     store = get_store()
 
-    order = None
-    for o in store.purchase_orders:
-        if o.order_id == order_id:
-            order = o
-            break
-
-    if not order:
+    existing = store.find_purchase_order(order_id)
+    if not existing:
         click.echo(f"✗ 未找到订单: {order_id}", err=True)
         sys.exit(1)
 
-    old_arrived = order.arrived_qty
-    if status:
-        order.status = status
-        if status == "已到货":
-            order.arrived_qty = order.qty
-    if arrived_qty is not None:
-        order.arrived_qty = min(arrived_qty, order.qty)
-        if order.arrived_qty >= order.qty:
-            order.status = "已到货"
-        elif order.arrived_qty > 0:
-            if order.status == "已下单":
-                order.status = "部分到货"
+    if arrived_qty is not None and arrived_qty < existing.arrived_qty:
+        click.echo(f"⚠ 已到货数量不能回退（当前{existing.arrived_qty}，请求{arrived_qty}），已自动取较大值", err=True)
+        arrived_qty = existing.arrived_qty
 
-    new_arrived_qty = order.arrived_qty - old_arrived
+    final_status = status or existing.status
+    order, new_arrived_qty = store.update_purchase_order_status(order_id, final_status, arrived_qty)
+
+    if not order:
+        click.echo(f"✗ 订单更新失败: {order_id}", err=True)
+        sys.exit(1)
+
     if new_arrived_qty > 0:
         inbound_id = f"IN_{datetime.now().strftime('%Y%m%d%H%M%S')}_{order_id[-4:]}"
         today = datetime.now().strftime("%Y-%m-%d")
@@ -512,8 +559,13 @@ def order_update(order_id, status, arrived_qty):
         click.echo(f"  入库数量: {new_arrived_qty}件, 门店: {store_id or '未指定'}")
 
     store.save()
+    pending_diff = (order.qty - order.arrived_qty)
     click.echo(f"✓ 订单 {order_id} 已更新")
     click.echo(f"  状态: {order.status}, 已到货: {order.arrived_qty}/{order.qty}")
+    if order.status in ("已下单", "部分到货"):
+        click.echo(f"  仍待到货: {pending_diff} 件")
+    else:
+        click.echo(f"  本订单待到货清零")
 
 
 @cli.group("inbound")
@@ -733,6 +785,177 @@ def transfer_simulate(group_by, limit, cross_region, max_cost_ratio, show_cost):
         sys.exit(1)
 
 
+@cli.group("transfer")
+def transfer_group():
+    """调拨单执行台账（创建、在途、收货）"""
+    pass
+
+
+@transfer_group.command("list")
+@click.option("--from-store", "from_store", type=str, default="", help="按调出门店筛选")
+@click.option("--to-store", "to_store", type=str, default="", help="按调入门店筛选")
+@click.option("--sku", type=str, default="", help="按商品SKU筛选")
+@click.option("--status", type=click.Choice(["已创建", "在途", "已收货", "已取消"]), default=None, help="按状态筛选")
+@click.option("--limit", type=int, default=30, help="显示前N条")
+def transfer_list(from_store, to_store, sku, status, limit):
+    """列出调拨单执行台账"""
+    store = get_store()
+    records = store.get_transfer_orders(from_store=from_store, to_store=to_store, sku=sku, status=status or "")
+    click.echo(f"✓ 共 {len(records)} 条调拨单")
+    if not records:
+        return
+    display = records[:limit]
+    data = []
+    for t in display:
+        from_s = store.stores.get(t.from_store_id)
+        to_s = store.stores.get(t.to_store_id)
+        prod = store.products.get(t.sku)
+        data.append({
+            "调拨单号": t.transfer_id,
+            "调出门店": f"{t.from_store_id} {from_s.name if from_s else ''}",
+            "调入门店": f"{t.to_store_id} {to_s.name if to_s else ''}",
+            "商品SKU": t.sku,
+            "商品名称": prod.name if prod else t.sku,
+            "数量": t.qty,
+            "已收货": t.received_qty,
+            "待收货": t.qty - t.received_qty,
+            "状态": t.status,
+            "创建日期": t.created_date,
+            "预计成本": t.estimated_cost,
+            "实际成本": t.actual_cost if t.actual_cost else "",
+            "备注": t.remark,
+        })
+    df = pd.DataFrame(data)
+    click.echo(tabulate(df, headers="keys", tablefmt="grid", showindex=False, floatfmt=".0f"))
+
+
+@transfer_group.command("create")
+@click.option("--idx", type=int, default=None, help="从 transfer-simulate 的第N条建议（1-based）创建调拨单")
+@click.option("--from-store", "from_store", type=str, default=None, help="手动指定调出门店")
+@click.option("--to-store", "to_store", type=str, default=None, help="手动指定调入门店")
+@click.option("--sku", type=str, default=None, help="手动指定商品SKU")
+@click.option("--qty", type=int, default=None, help="手动指定调拨数量")
+@click.option("--remark", type=str, default="", help="备注")
+def transfer_create(idx, from_store, to_store, sku, qty, remark):
+    """创建调拨单（可从 transfer-simulate 建议中选择，或手动指定）"""
+    store = get_store()
+    engine = SuggestionEngine(store)
+    try:
+        created = None
+        if idx is not None:
+            transfers = store.transfer_suggestions or engine.generate_transfer_suggestions()
+            if idx < 1 or idx > len(transfers):
+                click.echo(f"✗ 建议编号超出范围，当前共 {len(transfers)} 条", err=True)
+                sys.exit(1)
+            sug = transfers[idx - 1]
+            transfer_id = f"TO_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            today = datetime.now().strftime("%Y-%m-%d")
+            product = store.products.get(sug.sku)
+            unit_cost = product.unit_cost if product else 0.0
+            created = TransferOrder(
+                transfer_id=transfer_id,
+                from_store_id=sug.from_store_id,
+                to_store_id=sug.to_store_id,
+                sku=sug.sku,
+                qty=sug.transfer_qty,
+                status="已创建",
+                created_date=today,
+                unit_cost=unit_cost,
+                estimated_cost=round(sug.estimated_cost, 2),
+                remark=remark or f"来自调拨建议#{idx}：{sug.reason}",
+                source_suggestion_idx=idx - 1,
+            )
+        else:
+            if not (from_store and to_store and sku and qty):
+                click.echo("✗ 手动创建需要同时指定 --from-store / --to-store / --sku / --qty", err=True)
+                sys.exit(1)
+            transfer_id = f"TO_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            today = datetime.now().strftime("%Y-%m-%d")
+            product = store.products.get(sku)
+            unit_cost = product.unit_cost if product else 0.0
+            created = TransferOrder(
+                transfer_id=transfer_id,
+                from_store_id=from_store,
+                to_store_id=to_store,
+                sku=sku,
+                qty=qty,
+                status="已创建",
+                created_date=today,
+                unit_cost=unit_cost,
+                remark=remark,
+            )
+        if created:
+            store.add_transfer_order(created)
+            store.save()
+            click.echo(f"✓ 调拨单已创建: {created.transfer_id}")
+            click.echo(f"  {created.from_store_id} → {created.to_store_id}  {created.sku} × {created.qty}")
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        click.echo(f"✗ 创建调拨单失败: {e}", err=True)
+        sys.exit(1)
+
+
+@transfer_group.command("update")
+@click.argument("transfer_id")
+@click.option("--status", type=click.Choice(["已创建", "在途", "已收货", "已取消"]), default=None,
+              help="更新状态：在途/已收货/已取消")
+@click.option("--received-qty", type=int, default=None, help="收货数量（仅状态=已收货时生效，默认等于订单数量）")
+@click.option("--actual-cost", type=float, default=None, help="实际调拨成本（元）")
+def transfer_update(transfer_id, status, received_qty, actual_cost):
+    """更新调拨单状态，已收货时自动扣减调出方库存并增加调入方库存"""
+    store = get_store()
+    order = store.find_transfer_order(transfer_id)
+    if not order:
+        click.echo(f"✗ 未找到调拨单: {transfer_id}", err=True)
+        sys.exit(1)
+
+    if status:
+        order.status = status
+
+    if actual_cost is not None:
+        order.actual_cost = round(actual_cost, 2)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if status == "在途" and not order.in_transit_date:
+        order.in_transit_date = today
+        store.add_stock_in_transit(order.to_store_id, order.sku, order.qty)
+
+    if status == "已收货":
+        recv = received_qty if received_qty is not None else order.qty
+        recv = min(recv, order.qty)
+        old_recv = order.received_qty
+        new_recv = max(0, recv - old_recv)
+        order.received_qty = recv
+        order.received_date = today
+        if order.received_qty >= order.qty:
+            order.status = "已收货"
+        if new_recv > 0:
+            store.add_stock_qty(order.to_store_id, order.sku, new_recv)
+            stock_obj = store.get_stock_by_key(order.from_store_id, order.sku)
+            if stock_obj and stock_obj.current_stock >= new_recv:
+                stock_obj.current_stock -= new_recv
+            else:
+                store.add_stock_qty(order.from_store_id, order.sku, -new_recv)
+            store.add_stock_in_transit(order.to_store_id, order.sku, -new_recv)
+            click.echo(f"✓ 已处理收货: 调入方 +{new_recv}件，调出方 -{new_recv}件")
+        if not order.actual_cost and order.estimated_cost:
+            order.actual_cost = order.estimated_cost
+
+    if status == "已取消":
+        pending_cancel = order.qty - order.received_qty
+        if pending_cancel > 0 and order.status == "已取消":
+            if order.in_transit_date:
+                store.add_stock_in_transit(order.to_store_id, order.sku, -pending_cancel)
+                click.echo(f"✓ 已取消调拨单，在途库存 -{pending_cancel}件")
+
+    store.save()
+    click.echo(f"✓ 调拨单 {transfer_id} 已更新")
+    click.echo(f"  状态: {order.status}, 已收货: {order.received_qty}/{order.qty}")
+
+
 @cli.command("suggest")
 @click.option("--strategy", "strategy_id", default=None,
               help="指定策略ID（不指定则自动匹配商品/品类绑定的策略）")
@@ -764,12 +987,18 @@ def transfer_simulate(group_by, limit, cross_region, max_cost_ratio, show_cost):
               help="仅对指定品类做预算分配")
 @click.option("--priority-category", type=str, multiple=True, default=[],
               help="品类优先级，可多次指定，先指定的先分配预算")
+@click.option("--priority-store", type=str, multiple=True, default=[],
+              help="门店优先级，可多次指定，先指定的门店优先分配预算")
+@click.option("--category-budget", "category_budget", type=str, multiple=True, default=[],
+              help="品类预算池，格式 '品类名=金额'，可多次指定，如 --category-budget 饮料=20000")
+@click.option("--supplier-credit", "supplier_credit", type=str, multiple=True, default=[],
+              help="供应商信用额度，格式 '供应商ID=金额'，可多次指定")
 @click.option("--save-snapshot", is_flag=True, default=True,
               help="保存建议结果为复盘快照（默认开启）")
 def suggest_cmd(strategy_id, risk, need_replenish, stagnant, store_id, sku,
                 category, region, limit, show_strategy, ignore_pending,
                 budget, supplier, budget_category, priority_category,
-                save_snapshot):
+                priority_store, category_budget, supplier_credit, save_snapshot):
     """输出建议补货量、缺货风险等级、滞销提示和可调拨门店，可选择策略模板"""
     store = get_store()
 
@@ -802,19 +1031,67 @@ def suggest_cmd(strategy_id, risk, need_replenish, stagnant, store_id, sku,
         )
 
         cat_priority_list = list(priority_category) if priority_category else None
-        if budget > 0 or supplier or budget_category or cat_priority_list:
+        store_priority_list = list(priority_store) if priority_store else None
+
+        cat_budget_map = {}
+        for cb in category_budget:
+            if "=" in cb:
+                key, val = cb.split("=", 1)
+                try:
+                    cat_budget_map[key.strip()] = float(val.strip())
+                except ValueError:
+                    click.echo(f"⚠ 品类预算池格式错误，忽略: {cb}")
+
+        supplier_credit_map = {}
+        for sc in supplier_credit:
+            if "=" in sc:
+                key, val = sc.split("=", 1)
+                try:
+                    supplier_credit_map[key.strip()] = float(val.strip())
+                except ValueError:
+                    click.echo(f"⚠ 供应商信用额度格式错误，忽略: {sc}")
+
+        has_budget_params = any([
+            budget > 0, supplier, budget_category, cat_priority_list,
+            store_priority_list, cat_budget_map, supplier_credit_map
+        ])
+
+        if has_budget_params:
             budget_result = engine.allocate_budget(
                 suggestions,
                 budget_limit=budget,
                 supplier_filter=supplier,
                 category_filter=budget_category,
                 category_priority=cat_priority_list,
+                store_priority_list=store_priority_list,
+                supplier_credit_limits=supplier_credit_map,
+                category_budget_pools=cat_budget_map,
             )
             click.echo(f"✓ 预算分配完成: 使用{budget_result['budget_used']:.0f}/{budget_result['budget_limit']:.0f}元")
             if budget_result['compressed_count'] > 0:
                 click.echo(f"  压缩{budget_result['compressed_count']}条，缺口{budget_result['gap_total']}件")
             if budget_result['skipped_count'] > 0:
                 click.echo(f"  筛选排除{budget_result['skipped_count']}条")
+            if budget_result.get('deferred_count', 0) > 0:
+                click.echo(f"  延后至下一批{budget_result['deferred_count']}条，共{budget_result['deferred_qty_total']}件")
+            if budget_result.get('pool_summary'):
+                click.echo("  品类预算池:")
+                for pk, pv in budget_result['pool_summary'].items():
+                    limit_v = pv.get('limit', 0)
+                    used_v = pv.get('used', 0)
+                    rem_v = pv.get('remaining', 0)
+                    def_q = pv.get('deferred_qty', 0)
+                    if limit_v > 0:
+                        click.echo(f"    {pk}: 用{used_v:.0f}/{limit_v:.0f}元，剩{rem_v:.0f}元，延后{def_q}件")
+                    elif used_v > 0:
+                        click.echo(f"    {pk}: 未设上限，已用{used_v:.0f}元，延后{def_q}件")
+            if budget_result.get('supplier_summary'):
+                click.echo("  供应商信用额度:")
+                for sk, sv in budget_result['supplier_summary'].items():
+                    limit_v = sv.get('limit', 0)
+                    used_v = sv.get('used', 0)
+                    if limit_v > 0:
+                        click.echo(f"    {sk}: 用{used_v:.0f}/{limit_v:.0f}元")
 
         store.suggestions = suggestions
         store.save()
@@ -971,7 +1248,9 @@ def export_cmd(output, fmt, export_type, risk, need_replenish, include_forecast,
                 if export_type in ("delivery", "all"):
                     delivery_cols = ["门店ID", "门店名称", "区域", "门店类型", "商品SKU", "商品名称", "品类",
                                      "当前库存", "在途数量", "安全库存", "7天预测需求",
-                                     "缺货风险等级", "建议补货量", "使用策略", "可调拨门店", "建议原因"]
+                                     "缺货风险等级", "建议补货量", "使用策略", "可调拨门店", "建议原因",
+                                     "原始建议量", "预算缺口件数", "预算压缩原因", "预算调整后成本",
+                                     "预算池", "预算池上限(元)", "预算池已用(元)", "是否延后"]
                     delivery_df = df[[c for c in delivery_cols if c in df.columns]]
                     delivery_df = delivery_df.sort_values(
                         ["缺货风险等级", "区域", "门店名称"],
@@ -1017,7 +1296,9 @@ def export_cmd(output, fmt, export_type, risk, need_replenish, include_forecast,
                     delivery_file = f"{base}_配送.{fmt}"
                     delivery_cols = ["门店ID", "门店名称", "区域", "门店类型", "商品SKU", "商品名称", "品类",
                                      "当前库存", "在途数量", "安全库存", "7天预测需求",
-                                     "缺货风险等级", "建议补货量", "使用策略", "可调拨门店", "建议原因"]
+                                     "缺货风险等级", "建议补货量", "使用策略", "可调拨门店", "建议原因",
+                                     "原始建议量", "预算缺口件数", "预算压缩原因", "预算调整后成本",
+                                     "预算池", "预算池上限(元)", "预算池已用(元)", "是否延后"]
                     delivery_df = df[[c for c in delivery_cols if c in df.columns]]
                     delivery_df = delivery_df.sort_values(
                         ["缺货风险等级", "区域", "门店名称"],
@@ -1050,7 +1331,9 @@ def export_cmd(output, fmt, export_type, risk, need_replenish, include_forecast,
                 elif export_type == "delivery":
                     delivery_cols = ["门店ID", "门店名称", "区域", "门店类型", "商品SKU", "商品名称", "品类",
                                      "当前库存", "在途数量", "安全库存", "7天预测需求",
-                                     "缺货风险等级", "建议补货量", "使用策略", "可调拨门店", "建议原因"]
+                                     "缺货风险等级", "建议补货量", "使用策略", "可调拨门店", "建议原因",
+                                     "原始建议量", "预算缺口件数", "预算压缩原因", "预算调整后成本",
+                                     "预算池", "预算池上限(元)", "预算池已用(元)", "是否延后"]
                     delivery_df = df[[c for c in delivery_cols if c in df.columns]]
                     delivery_df = delivery_df.sort_values(
                         ["缺货风险等级", "区域", "门店名称"],
@@ -1343,29 +1626,39 @@ def snapshot_subgroup():
 @snapshot_subgroup.command("list")
 @click.option("--limit", type=int, default=20, help="显示前N条")
 def snapshot_list(limit):
-    """列出历史复盘快照"""
+    """列出历史复盘快照（默认按时间倒序，最新在前）"""
     store = get_store()
     snapshots = store.review_snapshots
     if not snapshots:
         click.echo("⚠ 暂无复盘快照，请先使用 suggest --save-snapshot 生成")
         return
-    snapshots_sorted = sorted(snapshots, key=lambda x: x.snapshot_date, reverse=True)
+    snapshots_sorted = sorted(snapshots, key=lambda x: (x.snapshot_date, x.summary.get("snapshot_time", "")), reverse=True)
     display = snapshots_sorted[:limit]
+    latest = snapshots_sorted[0] if snapshots_sorted else None
 
     click.echo(f"✓ 共 {len(snapshots)} 个复盘快照，显示前{len(display)}个")
+    if latest:
+        click.echo(f"  当前使用的快照（默认）: {latest.snapshot_id} @ {latest.summary.get('snapshot_time', latest.snapshot_date)}")
     data = []
     for s in display:
         summary = s.summary or {}
+        budget_used = summary.get("budget_used", 0)
+        budget_gap = summary.get("budget_gap_total", 0)
+        comp = summary.get("compressed_count", 0)
+        deferred = summary.get("deferred_count", 0)
+        budget_str = f"{budget_used:.0f}"
+        if comp > 0 or deferred > 0:
+            budget_str += f"（缺口{budget_gap}件，压{comp}条，延{deferred}条）"
+        risk_info = f"高{summary.get('risk_high', 0)} / 中{summary.get('risk_medium', 0)} / 低{summary.get('risk_low', 0)}"
         data.append({
             "快照ID": s.snapshot_id,
-            "快照日期": s.snapshot_date,
-            "策略ID": s.strategy_id,
-            "策略名称": s.strategy_name,
-            "建议明细数": summary.get("total_records", len(s.records)),
-            "需补货SKU数": summary.get("need_replenish_count", 0),
-            "总建议量(件)": summary.get("total_suggested_qty", 0),
-            "高风险数": summary.get("high_risk_count", 0),
-            "总预计成本(元)": summary.get("total_estimated_cost", 0),
+            "创建时间": summary.get("snapshot_time", s.snapshot_date),
+            "策略": f"{s.strategy_id} - {s.strategy_name}" if s.strategy_id else s.strategy_name,
+            "风险分布": risk_info,
+            "需补货SKU": summary.get("need_replenish_count", 0),
+            "建议总件数": summary.get("total_suggested_qty", 0),
+            "预算使用(元)": budget_str,
+            "明细数": summary.get("total_records", len(s.records)),
         })
     df = pd.DataFrame(data)
     click.echo(tabulate(df, headers="keys", tablefmt="grid", showindex=False, floatfmt=".0f"))
@@ -1566,6 +1859,11 @@ def status_cmd():
         inbound_cost = sum(r.qty * r.unit_cost for r in store.inbound_records)
         click.echo(f"  累计入库: {inbound_qty} 件，总金额 {inbound_cost:.0f} 元")
     click.echo(f"复盘快照: {len(store.review_snapshots)} 个")
+    click.echo(f"调拨台账: {len(store.transfer_orders)} 单")
+    if store.transfer_orders:
+        pending_t = [t for t in store.transfer_orders if t.status in ("已创建", "在途")]
+        pending_t_qty = sum(t.qty - t.received_qty for t in pending_t)
+        click.echo(f"  待收货: {len(pending_t)} 单，{pending_t_qty} 件")
     click.echo("")
     click.echo("=== 参数配置 ===")
     for k, v in store.config.items():
