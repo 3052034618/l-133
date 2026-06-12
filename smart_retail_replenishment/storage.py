@@ -63,6 +63,22 @@ class ReplenishmentStrategy:
             return True
         return False
 
+    def get_safety_factor_from_service_level(self) -> float:
+        service_level_factors = {
+            0.50: 0.0, 0.60: 0.25, 0.70: 0.52, 0.75: 0.67,
+            0.80: 0.84, 0.85: 1.04, 0.90: 1.28, 0.95: 1.65,
+            0.97: 1.88, 0.98: 2.05, 0.99: 2.33, 0.995: 2.58,
+            0.999: 3.09,
+        }
+        closest = min(service_level_factors.keys(), key=lambda x: abs(x - self.service_level))
+        z_score = service_level_factors[closest]
+        return z_score
+
+    def get_effective_safety_factor(self, base_safety_stock: int = 0) -> float:
+        z_factor = self.get_safety_factor_from_service_level()
+        base_factor = self.safety_stock_factor
+        return max(0.5, base_factor * (0.7 + z_factor * 0.3))
+
 
 @dataclass
 class TransferSuggestion:
@@ -73,6 +89,9 @@ class TransferSuggestion:
     transfer_qty: int
     priority: int
     reason: str
+    estimated_cost: float = 0.0
+    is_cross_region: bool = False
+    same_region: bool = True
 
 
 @dataclass
@@ -150,6 +169,7 @@ class SuggestionRecord:
     current_stock: int
     in_transit: int
     safety_stock: int
+    pending_order_qty: int = 0
     strategy_id: str = ""
     strategy_name: str = ""
 
@@ -164,6 +184,32 @@ class DataQualityIssue:
     description: str
 
 
+@dataclass
+class PurchaseOrder:
+    """采购订单记录"""
+    order_id: str
+    sku: str
+    qty: int
+    status: str = "已下单"
+    ordered_date: str = ""
+    expected_arrival_date: str = ""
+    arrived_qty: int = 0
+    unit_cost: float = 0.0
+    supplier: str = ""
+    store_id: str = ""
+    remark: str = ""
+
+
+@dataclass
+class TransferCost:
+    """调拨成本配置"""
+    from_region: str
+    to_region: str
+    cost_per_unit: float = 1.0
+    fixed_cost: float = 0.0
+    lead_time_days: int = 1
+
+
 class DataStore:
     def __init__(self):
         self.products: Dict[str, Product] = {}
@@ -176,6 +222,8 @@ class DataStore:
         self.strategies: Dict[str, ReplenishmentStrategy] = {}
         self.transfer_suggestions: List[TransferSuggestion] = []
         self.data_quality_issues: List[DataQualityIssue] = []
+        self.purchase_orders: List[PurchaseOrder] = []
+        self.transfer_costs: List[TransferCost] = []
         self.config: Dict[str, Any] = {
             "holiday_factor": 1.3,
             "default_min_order_qty": 1,
@@ -184,6 +232,9 @@ class DataStore:
             "default_lead_time_days": 3,
             "default_service_level": 0.95,
             "last_forecast_group_by": "sku",
+            "allow_cross_region_transfer": True,
+            "max_transfer_cost_ratio": 0.1,
+            "default_transfer_cost_per_unit": 2.0,
         }
 
     def save(self):
@@ -198,6 +249,8 @@ class DataStore:
             "suggestions": [asdict(s) for s in self.suggestions],
             "strategies": [asdict(s) for s in self.strategies.values()],
             "transfer_suggestions": [asdict(s) for s in self.transfer_suggestions],
+            "purchase_orders": [asdict(o) for o in self.purchase_orders],
+            "transfer_costs": [asdict(c) for c in self.transfer_costs],
             "config": self.config,
         }
         data = _convert_numpy_types(data)
@@ -219,6 +272,8 @@ class DataStore:
         self.suggestions = [SuggestionRecord(**s) for s in data.get("suggestions", [])]
         self.strategies = {s["strategy_id"]: ReplenishmentStrategy(**s) for s in data.get("strategies", [])}
         self.transfer_suggestions = [TransferSuggestion(**s) for s in data.get("transfer_suggestions", [])]
+        self.purchase_orders = [PurchaseOrder(**o) for o in data.get("purchase_orders", [])]
+        self.transfer_costs = [TransferCost(**c) for c in data.get("transfer_costs", [])]
         self.config.update(data.get("config", {}))
 
     def clear_sales(self):
@@ -234,6 +289,49 @@ class DataStore:
     def remove_strategy(self, strategy_id: str):
         if strategy_id in self.strategies:
             del self.strategies[strategy_id]
+
+    def add_purchase_order(self, order: PurchaseOrder):
+        self.purchase_orders.append(order)
+
+    def update_purchase_order_status(self, order_id: str, status: str, arrived_qty: Optional[int] = None):
+        for order in self.purchase_orders:
+            if order.order_id == order_id:
+                order.status = status
+                if arrived_qty is not None:
+                    order.arrived_qty = arrived_qty
+                break
+
+    def get_pending_orders_for_sku(self, sku: str, store_id: str = "") -> List[PurchaseOrder]:
+        result = []
+        for order in self.purchase_orders:
+            if order.sku != sku:
+                continue
+            if store_id and order.store_id != store_id:
+                continue
+            if order.status in ("已下单", "部分到货"):
+                result.append(order)
+        return result
+
+    def get_total_pending_qty(self, sku: str, store_id: str = "") -> int:
+        orders = self.get_pending_orders_for_sku(sku, store_id)
+        total = 0
+        for order in orders:
+            total += (order.qty - order.arrived_qty)
+        return total
+
+    def add_transfer_cost(self, cost: TransferCost):
+        self.transfer_costs.append(cost)
+
+    def get_transfer_cost(self, from_region: str, to_region: str) -> TransferCost:
+        for cost in self.transfer_costs:
+            if cost.from_region == from_region and cost.to_region == to_region:
+                return cost
+        default_cost = float(self.config.get("default_transfer_cost_per_unit", 2.0))
+        is_same = from_region == to_region
+        if is_same:
+            return TransferCost(from_region=from_region, to_region=to_region, cost_per_unit=default_cost * 0.5, fixed_cost=0.0, lead_time_days=1)
+        else:
+            return TransferCost(from_region=from_region, to_region=to_region, cost_per_unit=default_cost, fixed_cost=5.0, lead_time_days=2)
 
     def get_strategy_for(self, category: str, sku: str) -> Optional[ReplenishmentStrategy]:
         product = self.products.get(sku)

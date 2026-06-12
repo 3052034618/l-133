@@ -1,9 +1,9 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 import pandas as pd
 import math
 
-from .storage import DataStore, SuggestionRecord, StockRecord, ReplenishmentStrategy, TransferSuggestion
+from .storage import DataStore, SuggestionRecord, StockRecord, ReplenishmentStrategy, TransferSuggestion, PurchaseOrder
 
 
 RISK_HIGH = "高"
@@ -15,12 +15,23 @@ class SuggestionEngine:
     def __init__(self, store: DataStore):
         self.store = store
         self.current_strategy: str = ""
+        self.include_pending_orders: bool = True
 
     def _get_stock_map(self) -> Dict[Tuple[str, str], StockRecord]:
         result = {}
         for s in self.store.stocks:
             result[(s.store_id, s.sku)] = s
         return result
+
+    def _get_pending_order_qty(self, store_id: str, sku: str) -> int:
+        if not self.include_pending_orders:
+            return 0
+        return self.store.get_total_pending_qty(sku, store_id)
+
+    def _get_available_stock(self, stock: StockRecord, store_id: str, sku: str) -> int:
+        base = stock.current_stock + stock.in_transit
+        pending = self._get_pending_order_qty(store_id, sku)
+        return base + pending
 
     def _get_forecast_7d_map(self) -> Dict[Tuple[str, str], float]:
         result = defaultdict(float)
@@ -50,14 +61,22 @@ class SuggestionEngine:
             groups[key].append(store_id)
         return dict(groups)
 
-    def _assess_risk(self, current_stock: int, in_transit: int,
+    def _assess_risk(self, current_stock: int, in_transit: int, pending_order: int,
                      forecast_7d: float, safety_stock: int,
-                     daily_forecast: List[Tuple[str, float]]) -> str:
-        available = current_stock + in_transit
+                     daily_forecast: List[Tuple[str, float]],
+                     strategy: Optional[ReplenishmentStrategy] = None) -> str:
+        available = current_stock + in_transit + pending_order
         avg_daily = forecast_7d / 7.0 if forecast_7d > 0 else 0
 
         if avg_daily <= 0:
             return RISK_LOW
+
+        if strategy:
+            effective_safety = safety_stock * strategy.get_effective_safety_factor(safety_stock)
+            service_level = strategy.service_level
+        else:
+            effective_safety = safety_stock
+            service_level = 0.95
 
         days_cover = available / avg_daily if avg_daily > 0 else 999
 
@@ -69,15 +88,20 @@ class SuggestionEngine:
                 stockout_day = day_idx + 1
                 break
 
-        if stockout_day is not None and stockout_day <= 3:
+        if stockout_day is not None and stockout_day <= 2:
             return RISK_HIGH
-        if stockout_day is not None and stockout_day <= 7:
+        if stockout_day is not None and stockout_day <= 5:
             return RISK_MEDIUM
-        if available < safety_stock:
-            return RISK_MEDIUM
+        if available < effective_safety:
+            if service_level >= 0.98:
+                return RISK_HIGH
+            elif service_level >= 0.90:
+                return RISK_MEDIUM
+            else:
+                return RISK_LOW
         if days_cover < 3:
             return RISK_HIGH
-        if days_cover < 7:
+        if days_cover < 5:
             return RISK_MEDIUM
         return RISK_LOW
 
@@ -89,8 +113,9 @@ class SuggestionEngine:
         days_cover = current_stock / avg_daily
         return days_cover > turnover_days * 2
 
-    def _calculate_surplus(self, stock: StockRecord, forecast_7d: float) -> float:
-        available = stock.current_stock + stock.in_transit
+    def _calculate_surplus(self, stock: StockRecord, forecast_7d: float,
+                           store_id: str, sku: str) -> float:
+        available = self._get_available_stock(stock, store_id, sku)
         return available - forecast_7d
 
     def _find_transferable_stores(self, target_store_id: str, sku: str,
@@ -108,7 +133,7 @@ class SuggestionEngine:
             if s_sku != sku or store_id == target_store_id:
                 continue
             store_forecast = forecast_map.get((store_id, sku), 0.0)
-            surplus = self._calculate_surplus(stock, store_forecast)
+            surplus = self._calculate_surplus(stock, store_forecast, store_id, sku)
             if surplus > avg_daily_needed * 2:
                 source_store = self.store.stores.get(store_id)
                 if source_store and source_store.region == target_region:
@@ -135,7 +160,7 @@ class SuggestionEngine:
         else:
             return math.ceil(qty / min_order_qty) * min_order_qty
 
-    def _calculate_suggested_qty(self, current_stock: int, in_transit: int,
+    def _calculate_suggested_qty(self, current_stock: int, in_transit: int, pending_order: int,
                                  forecast_7d: float, safety_stock: int,
                                  strategy: ReplenishmentStrategy) -> Tuple[int, str]:
         if forecast_7d <= 0:
@@ -146,18 +171,21 @@ class SuggestionEngine:
         lead_time_days = strategy.lead_time_days
         safety_factor = strategy.safety_stock_factor
         rounding = strategy.order_rounding
+        service_level = strategy.service_level
+
+        effective_safety_factor = strategy.get_effective_safety_factor()
 
         avg_daily = forecast_7d / 7.0
         cycle_stock = avg_daily * turnover_days
         lead_time_stock = avg_daily * lead_time_days
-        safety_stock_calc = safety_stock * safety_factor
+        safety_stock_calc = safety_stock * effective_safety_factor
         target_stock = cycle_stock + lead_time_stock + safety_stock_calc
 
-        available = current_stock + in_transit
+        available = current_stock + in_transit + pending_order
         needed = max(0, target_stock - available)
 
         if needed <= 0:
-            return 0, "库存充足"
+            return 0, f"库存充足(可用{available}件，目标{int(target_stock)}件)"
 
         suggested = self._apply_order_rounding(needed, min_order_qty, rounding)
 
@@ -167,24 +195,48 @@ class SuggestionEngine:
         reason_parts = []
         if current_stock < safety_stock:
             reason_parts.append(f"当前库存低于安全库存({safety_stock})")
-        if in_transit == 0:
-            reason_parts.append("无在途补货")
+        if in_transit == 0 and pending_order == 0:
+            reason_parts.append("无在途/已下单补货")
+        elif pending_order > 0:
+            reason_parts.append(f"已下单{pending_order}件在途")
         reason_parts.append(f"7天预测需求约{forecast_7d:.1f}")
-        reason_parts.append(f"策略:{strategy.name}(周转{turnover_days}天,提前期{lead_time_days}天)")
+        reason_parts.append(f"策略:{strategy.name}(服务水平{service_level:.0%},周转{turnover_days}天,提前期{lead_time_days}天)")
+        reason_parts.append(f"有效安全系数:{effective_safety_factor:.2f}x")
 
         return suggested, "；".join(reason_parts)
 
-    def generate_transfer_suggestions(self, group_by: str = "region") -> List[TransferSuggestion]:
+    def generate_transfer_suggestions(self, group_by: str = "region",
+                                       allow_cross_region: Optional[bool] = None,
+                                       max_cost_ratio: Optional[float] = None) -> List[TransferSuggestion]:
         stock_map = self._get_stock_map()
         forecast_map = self._get_forecast_7d_map()
-        groups = self._get_group_stores(group_by)
 
-        transfers = []
+        if allow_cross_region is None:
+            allow_cross_region = bool(self.store.config.get("allow_cross_region_transfer", True))
+        if max_cost_ratio is None:
+            max_cost_ratio = float(self.store.config.get("max_transfer_cost_ratio", 0.1))
+
+        all_stores = list(self.store.stores.keys())
         all_skus = set()
         for (_, sku) in stock_map.keys():
             all_skus.add(sku)
 
-        for group_name, store_ids in groups.items():
+        transfers = []
+
+        store_sku_map = defaultdict(list)
+        for store_id, store in self.store.stores.items():
+            key = ""
+            if group_by == "region":
+                key = store.region or "未分组"
+            elif group_by == "store_type":
+                key = store.store_type or "未分组"
+            elif group_by == "group_name":
+                key = store.group_name or "未分组"
+            else:
+                key = "全部"
+            store_sku_map[key].append(store_id)
+
+        for group_name, store_ids in store_sku_map.items():
             for sku in all_skus:
                 deficit_stores = []
                 surplus_stores = []
@@ -194,13 +246,18 @@ class SuggestionEngine:
                     if not stock:
                         continue
                     forecast = forecast_map.get((store_id, sku), 0.0)
-                    surplus = self._calculate_surplus(stock, forecast)
+                    surplus = self._calculate_surplus(stock, forecast, store_id, sku)
                     avg_daily = forecast / 7.0 if forecast > 0 else 0
                     daily_forecast = self._get_daily_forecast_map().get((store_id, sku), [])
 
+                    product = self.store.products.get(sku)
+                    category = product.category if product else ""
+                    strategy = self.store.get_strategy_for(category, sku)
+
                     if surplus < 0:
                         risk = self._assess_risk(stock.current_stock, stock.in_transit,
-                                                 forecast, stock.safety_stock, daily_forecast)
+                                                 self._get_pending_order_qty(store_id, sku),
+                                                 forecast, stock.safety_stock, daily_forecast, strategy)
                         deficit_stores.append({
                             "store_id": store_id,
                             "deficit": abs(surplus),
@@ -220,7 +277,11 @@ class SuggestionEngine:
                     if deficit["deficit"] <= 0:
                         continue
                     remaining_needed = deficit["deficit"]
-                    target_region = self.store.stores.get(deficit["store_id"]).region if self.store.stores.get(deficit["store_id"]) else ""
+                    target_store = self.store.stores.get(deficit["store_id"])
+                    target_region = target_store.region if target_store else ""
+
+                    product = self.store.products.get(sku)
+                    unit_cost = product.unit_cost if product else 0.0
 
                     sorted_surplus = sorted(
                         surplus_stores,
@@ -234,23 +295,56 @@ class SuggestionEngine:
                         if surplus["surplus"] <= 0 or remaining_needed <= 0:
                             continue
                         transfer_qty = min(int(remaining_needed), int(surplus["surplus"]))
-                        if transfer_qty > 0:
-                            is_same_region = (
-                                (self.store.stores.get(surplus["store_id"]).region if self.store.stores.get(surplus["store_id"]) else "") == target_region
-                            )
-                            priority = self._calculate_transfer_priority(
-                                deficit["risk"], transfer_qty, is_same_region
-                            )
-                            transfers.append(TransferSuggestion(
-                                from_store_id=surplus["store_id"],
-                                to_store_id=deficit["store_id"],
-                                sku=sku,
-                                transfer_qty=transfer_qty,
-                                priority=priority,
-                                reason=f"{group_name}内调拨：{deficit['risk']}风险缺货{int(remaining_needed)}件，{surplus['store_id']}富余{int(surplus['surplus'])}件"
-                            ))
-                            surplus["surplus"] -= transfer_qty
-                            remaining_needed -= transfer_qty
+                        if transfer_qty <= 0:
+                            continue
+
+                        source_store = self.store.stores.get(surplus["store_id"])
+                        source_region = source_store.region if source_store else ""
+                        is_same_region = source_region == target_region
+                        is_cross_region = not is_same_region
+
+                        if is_cross_region and not allow_cross_region:
+                            continue
+
+                        if is_cross_region and deficit["risk"] != "高":
+                            continue
+
+                        estimated_cost = self._estimate_transfer_cost(
+                            surplus["store_id"], deficit["store_id"], transfer_qty
+                        )
+
+                        if unit_cost > 0 and is_cross_region:
+                            cost_ratio = estimated_cost / (unit_cost * transfer_qty)
+                            if cost_ratio > max_cost_ratio:
+                                continue
+
+                        priority = self._calculate_transfer_priority(
+                            deficit["risk"], transfer_qty, is_same_region
+                        )
+
+                        reason_parts = []
+                        if is_same_region:
+                            reason_parts.append(f"同区域({source_region})调拨")
+                        else:
+                            reason_parts.append(f"跨区域({source_region}→{target_region})调拨")
+                        reason_parts.append(f"{deficit['risk']}风险缺货{int(deficit['deficit'])}件")
+                        reason_parts.append(f"{surplus['store_id']}富余{int(surplus['surplus'])}件")
+                        if is_cross_region:
+                            reason_parts.append(f"成本约{estimated_cost:.1f}元")
+
+                        transfers.append(TransferSuggestion(
+                            from_store_id=surplus["store_id"],
+                            to_store_id=deficit["store_id"],
+                            sku=sku,
+                            transfer_qty=transfer_qty,
+                            priority=priority,
+                            reason="；".join(reason_parts),
+                            estimated_cost=estimated_cost,
+                            is_cross_region=is_cross_region,
+                            same_region=is_same_region,
+                        ))
+                        surplus["surplus"] -= transfer_qty
+                        remaining_needed -= transfer_qty
 
         transfers.sort(key=lambda x: -x.priority)
         self.store.transfer_suggestions = transfers
@@ -302,9 +396,10 @@ class SuggestionEngine:
             current_stock = stock.current_stock if stock else 0
             in_transit = stock.in_transit if stock else 0
             safety_stock = stock.safety_stock if stock else 0
+            pending_order = self._get_pending_order_qty(store_id, sku)
 
-            risk_level = self._assess_risk(current_stock, in_transit, forecast_7d,
-                                           safety_stock, daily_forecast)
+            risk_level = self._assess_risk(current_stock, in_transit, pending_order,
+                                           forecast_7d, safety_stock, daily_forecast, strategy)
 
             stagnant = self._check_stagnant(current_stock, forecast_7d, strategy.target_turnover_days)
 
@@ -315,7 +410,7 @@ class SuggestionEngine:
                 reason = f"库存滞销：当前库存可售约{current_stock / (forecast_7d / 7.0):.0f}天" if forecast_7d > 0 else "库存滞销：无需求预测"
             else:
                 suggested_qty, reason = self._calculate_suggested_qty(
-                    current_stock, in_transit, forecast_7d, safety_stock, strategy
+                    current_stock, in_transit, pending_order, forecast_7d, safety_stock, strategy
                 )
 
             suggestions.append(SuggestionRecord(
@@ -330,6 +425,7 @@ class SuggestionEngine:
                 current_stock=current_stock,
                 in_transit=in_transit,
                 safety_stock=safety_stock,
+                pending_order_qty=pending_order,
                 strategy_id=used_strategy_id,
                 strategy_name=used_strategy_name,
             ))
@@ -356,6 +452,7 @@ class SuggestionEngine:
                 "品类": product.category if product else "",
                 "当前库存": s.current_stock,
                 "在途数量": s.in_transit,
+                "已下单未到": s.pending_order_qty,
                 "安全库存": s.safety_stock,
                 "7天预测需求": s.forecast_7d,
                 "缺货风险等级": s.risk_level,
@@ -379,6 +476,7 @@ class SuggestionEngine:
             product = self.store.products.get(t.sku)
             data.append({
                 "优先级": t.priority,
+                "是否跨区域": "是" if t.is_cross_region else "否",
                 "调出门店ID": t.from_store_id,
                 "调出门店名称": from_store.name if from_store else t.from_store_id,
                 "调入门店ID": t.to_store_id,
@@ -386,10 +484,21 @@ class SuggestionEngine:
                 "商品SKU": t.sku,
                 "商品名称": product.name if product else t.sku,
                 "调拨数量": t.transfer_qty,
+                "预计调拨成本": round(t.estimated_cost, 2),
                 "调拨原因": t.reason,
             })
 
         return pd.DataFrame(data)
+
+    def _estimate_transfer_cost(self, from_store_id: str, to_store_id: str, qty: int) -> float:
+        from_store = self.store.stores.get(from_store_id)
+        to_store = self.store.stores.get(to_store_id)
+        from_region = from_store.region if from_store else ""
+        to_region = to_store.region if to_store else ""
+
+        cost_config = self.store.get_transfer_cost(from_region, to_region)
+        total_cost = cost_config.fixed_cost + cost_config.cost_per_unit * qty
+        return total_cost
 
     def filter_suggestions(self, suggestions: List[SuggestionRecord],
                            risk_filter: str = None,
@@ -425,6 +534,7 @@ class SuggestionEngine:
         for group_name, store_ids in groups.items():
             total_stock = 0
             total_in_transit = 0
+            total_pending = 0
             total_forecast = 0
             deficit_count = 0
             surplus_count = 0
@@ -437,16 +547,23 @@ class SuggestionEngine:
                     forecast = forecast_map.get((store_id, sku), 0.0)
                     total_stock += stock.current_stock
                     total_in_transit += stock.in_transit
+                    pending = self._get_pending_order_qty(store_id, sku)
+                    total_pending += pending
                     total_forecast += forecast
-                    available = stock.current_stock + stock.in_transit
+                    available = stock.current_stock + stock.in_transit + pending
                     if available < forecast:
                         deficit_count += 1
                     elif available > forecast * 1.5:
                         surplus_count += 1
 
+                    product = self.store.products.get(sku)
+                    category = product.category if product else ""
+                    strategy = self.store.get_strategy_for(category, sku)
+
                     daily_forecast = self._get_daily_forecast_map().get((store_id, sku), [])
                     risk = self._assess_risk(stock.current_stock, stock.in_transit,
-                                             forecast, stock.safety_stock, daily_forecast)
+                                             pending, forecast, stock.safety_stock,
+                                             daily_forecast, strategy)
                     if risk == RISK_HIGH:
                         high_risk_count += 1
 
@@ -455,6 +572,7 @@ class SuggestionEngine:
                 "门店数": len(store_ids),
                 "总库存": total_stock,
                 "总在途": total_in_transit,
+                "已下单未到": total_pending,
                 "7天总预测": round(total_forecast, 1),
                 "缺货门店SKU数": deficit_count,
                 "富余门店SKU数": surplus_count,

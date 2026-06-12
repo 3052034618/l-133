@@ -204,6 +204,50 @@ def write_promotions():
     print(f"生成: {path}")
 
 
+def write_purchase_orders():
+    path = os.path.join(EXAMPLES_DIR, "purchase_orders.csv")
+    today = datetime.now()
+
+    orders = [
+        ("PO20260101001", "SKU001", 500, "已下单", "2026-06-25", "2026-06-28", 0, 3.5, "供应商A", "S001", "常规补货"),
+        ("PO20260101002", "SKU005", 1000, "部分到货", "2026-06-24", "2026-06-27", 600, 1.5, "供应商B", "S002", "促销备货"),
+        ("PO20260101003", "SKU003", 200, "已到货", "2026-06-20", "2026-06-23", 200, 8.0, "供应商C", "S003", "新品上架"),
+        ("PO20260101004", "SKU008", 800, "已下单", "2026-06-26", "2026-06-30", 0, 5.0, "供应商A", "S001", "补货"),
+    ]
+
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["order_id", "sku", "qty", "status", "ordered_date",
+                        "expected_arrival_date", "arrived_qty", "unit_cost",
+                        "supplier", "store_id", "remark"])
+        for o in orders:
+            writer.writerow(o)
+    print(f"生成: {path}")
+
+
+def write_transfer_costs():
+    path = os.path.join(EXAMPLES_DIR, "transfer_costs.csv")
+
+    costs = [
+        ("华东区", "华东区", 0.5, 50, 1),
+        ("华北区", "华北区", 0.6, 60, 1),
+        ("华南区", "华南区", 0.5, 55, 1),
+        ("华东区", "华北区", 2.0, 200, 3),
+        ("华东区", "华南区", 2.5, 250, 4),
+        ("华北区", "华南区", 2.2, 220, 3),
+        ("华北区", "华东区", 2.0, 200, 3),
+        ("华南区", "华东区", 2.5, 250, 4),
+        ("华南区", "华北区", 2.2, 220, 3),
+    ]
+
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["from_region", "to_region", "cost_per_unit", "fixed_cost", "lead_time_days"])
+        for c in costs:
+            writer.writerow(c)
+    print(f"生成: {path}")
+
+
 if __name__ == "__main__":
     write_products()
     write_stores()
@@ -211,5 +255,7 @@ if __name__ == "__main__":
     write_sales()
     write_stock()
     write_promotions()
+    write_purchase_orders()
+    write_transfer_costs()
     write_bad_data_samples()
     print(f"\n示例数据已生成到: {EXAMPLES_DIR}")

@@ -213,8 +213,8 @@ class Forecaster:
             grouped = df.groupby(["category", "forecast_date"], as_index=False)[value_cols].sum()
             grouped = grouped.rename(columns={"category": "品类", "forecast_date": "预测日期"})
         elif group_by == "sku":
-            grouped = df.groupby(["store_id", "store_name", "sku", "product_name", "category", "forecast_date"], as_index=False)[value_cols].sum()
-            grouped = grouped.rename(columns={"store_id": "门店ID", "store_name": "门店名称", "sku": "商品SKU", "product_name": "商品名称", "category": "品类", "forecast_date": "预测日期"})
+            grouped = df.groupby(["sku", "product_name", "category", "forecast_date"], as_index=False)[value_cols].sum()
+            grouped = grouped.rename(columns={"sku": "商品SKU", "product_name": "商品名称", "category": "品类", "forecast_date": "预测日期"})
         else:
             grouped = df
 
@@ -263,9 +263,8 @@ class Forecaster:
                 "promo_increment": "7天促销增量", "holiday_increment": "7天假日增量"
             })
         else:
-            summary = df.groupby(["store_id", "store_name", "sku", "product_name", "category"], as_index=False)[value_cols].sum()
+            summary = df.groupby(["sku", "product_name", "category"], as_index=False)[value_cols].sum()
             summary = summary.rename(columns={
-                "store_id": "门店ID", "store_name": "门店名称",
                 "sku": "商品SKU", "product_name": "商品名称", "category": "品类",
                 "forecast_qty": "7天预测需求", "baseline_qty": "7天基准销量",
                 "promo_increment": "7天促销增量", "holiday_increment": "7天假日增量"
@@ -283,7 +282,7 @@ class Forecaster:
         value_cols_map = {
             "store": ["门店ID", "门店名称", "区域", "门店类型", "预测日期", "预测数量", "基准销量", "促销增量", "假日增量"],
             "category": ["品类", "预测日期", "预测数量", "基准销量", "促销增量", "假日增量"],
-            "sku": ["门店ID", "门店名称", "商品SKU", "商品名称", "品类", "预测日期", "预测数量", "基准销量", "促销增量", "假日增量"],
+            "sku": ["商品SKU", "商品名称", "品类", "预测日期", "预测数量", "基准销量", "促销增量", "假日增量"],
         }
 
         cols = value_cols_map.get(group_by, list(df.columns))
