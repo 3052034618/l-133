@@ -1,0 +1,7 @@
+﻿strategy_id,name,service_level,lead_time_days,target_turnover_days,min_order_qty,order_rounding,safety_stock_factor,scope_category,scope_sku,description
+STRAT001,乳制品快周转策略,0.98,2,5,24,ceiling,2.0,乳制品,,短保质期商品，高服务水平
+STRAT002,烘焙新鲜策略,0.95,1,3,6,floor,1.5,烘焙,,当日新鲜，控制周转
+STRAT003,饮料促销策略,0.9,3,14,24,ceiling,1.8,饮料,,大促期间高备货
+STRAT004,日化标准策略,0.95,5,60,6,round,1.5,日化,,长保质期，标准周转
+STRAT005,零食标准策略,0.95,3,30,12,ceiling,1.5,零食,,标准库存策略
+STRAT006,蛋品标准策略,0.95,2,7,1,ceiling,1.5,蛋品,,短保质期

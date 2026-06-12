@@ -4,6 +4,24 @@ from datetime import datetime, date
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict, field
 import pandas as pd
+import numpy as np
+
+
+def _convert_numpy_types(obj):
+    if isinstance(obj, dict):
+        return {k: _convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, (np.bool_, np.bool)):
+        return bool(obj)
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.str_):
+        return str(obj)
+    else:
+        return obj
 
 
 DATA_DIR = os.path.join(os.getcwd(), ".retail_data")
@@ -20,6 +38,44 @@ def _data_path(filename: str) -> str:
 
 
 @dataclass
+class ReplenishmentStrategy:
+    """补货策略模板"""
+    strategy_id: str
+    name: str
+    service_level: float = 0.95
+    lead_time_days: int = 3
+    target_turnover_days: int = 7
+    min_order_qty: int = 1
+    order_rounding: str = "ceiling"
+    safety_stock_factor: float = 1.5
+    description: str = ""
+    scope_category: str = ""
+    scope_sku: str = ""
+
+    def matches(self, category: str, sku: str) -> bool:
+        sku_val = self.scope_sku if isinstance(self.scope_sku, str) else ""
+        cat_val = self.scope_category if isinstance(self.scope_category, str) else ""
+        if sku_val and sku_val == sku:
+            return True
+        if cat_val and cat_val == category:
+            return True
+        if not cat_val and not sku_val:
+            return True
+        return False
+
+
+@dataclass
+class TransferSuggestion:
+    """调拨建议记录"""
+    from_store_id: str
+    to_store_id: str
+    sku: str
+    transfer_qty: int
+    priority: int
+    reason: str
+
+
+@dataclass
 class Product:
     sku: str
     name: str
@@ -28,6 +84,7 @@ class Product:
     min_order_qty: int = 1
     turnover_days: int = 7
     unit_cost: float = 0.0
+    strategy_id: str = ""
 
 
 @dataclass
@@ -35,6 +92,8 @@ class Store:
     store_id: str
     name: str
     region: str = ""
+    store_type: str = ""
+    group_name: str = ""
     address: str = ""
 
 
@@ -64,6 +123,7 @@ class PromotionRecord:
     end_date: str
     uplift_factor: float = 1.5
     store_id: str = ""
+    is_all_stores: bool = False
 
 
 @dataclass
@@ -72,6 +132,9 @@ class ForecastRecord:
     sku: str
     forecast_date: str
     forecast_qty: float
+    baseline_qty: float = 0.0
+    promo_increment: float = 0.0
+    holiday_increment: float = 0.0
 
 
 @dataclass
@@ -87,6 +150,18 @@ class SuggestionRecord:
     current_stock: int
     in_transit: int
     safety_stock: int
+    strategy_id: str = ""
+    strategy_name: str = ""
+
+
+@dataclass
+class DataQualityIssue:
+    """数据质量问题记录"""
+    issue_type: str
+    severity: str
+    table_name: str
+    record_key: str
+    description: str
 
 
 class DataStore:
@@ -98,11 +173,17 @@ class DataStore:
         self.promotions: List[PromotionRecord] = []
         self.forecasts: List[ForecastRecord] = []
         self.suggestions: List[SuggestionRecord] = []
+        self.strategies: Dict[str, ReplenishmentStrategy] = {}
+        self.transfer_suggestions: List[TransferSuggestion] = []
+        self.data_quality_issues: List[DataQualityIssue] = []
         self.config: Dict[str, Any] = {
             "holiday_factor": 1.3,
             "default_min_order_qty": 1,
             "default_turnover_days": 7,
             "forecast_days": 7,
+            "default_lead_time_days": 3,
+            "default_service_level": 0.95,
+            "last_forecast_group_by": "sku",
         }
 
     def save(self):
@@ -115,8 +196,11 @@ class DataStore:
             "promotions": [asdict(p) for p in self.promotions],
             "forecasts": [asdict(f) for f in self.forecasts],
             "suggestions": [asdict(s) for s in self.suggestions],
+            "strategies": [asdict(s) for s in self.strategies.values()],
+            "transfer_suggestions": [asdict(s) for s in self.transfer_suggestions],
             "config": self.config,
         }
+        data = _convert_numpy_types(data)
         with open(_data_path("datastore.json"), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -133,6 +217,8 @@ class DataStore:
         self.promotions = [PromotionRecord(**p) for p in data.get("promotions", [])]
         self.forecasts = [ForecastRecord(**f) for f in data.get("forecasts", [])]
         self.suggestions = [SuggestionRecord(**s) for s in data.get("suggestions", [])]
+        self.strategies = {s["strategy_id"]: ReplenishmentStrategy(**s) for s in data.get("strategies", [])}
+        self.transfer_suggestions = [TransferSuggestion(**s) for s in data.get("transfer_suggestions", [])]
         self.config.update(data.get("config", {}))
 
     def clear_sales(self):
@@ -141,6 +227,28 @@ class DataStore:
     def clear_stock_data(self):
         self.stocks = []
         self.promotions = []
+
+    def add_strategy(self, strategy: ReplenishmentStrategy):
+        self.strategies[strategy.strategy_id] = strategy
+
+    def remove_strategy(self, strategy_id: str):
+        if strategy_id in self.strategies:
+            del self.strategies[strategy_id]
+
+    def get_strategy_for(self, category: str, sku: str) -> Optional[ReplenishmentStrategy]:
+        product = self.products.get(sku)
+        if product and product.strategy_id and product.strategy_id in self.strategies:
+            return self.strategies[product.strategy_id]
+        sku_specific = [s for s in self.strategies.values() if (s.scope_sku and isinstance(s.scope_sku, str) and s.scope_sku.strip() == sku)]
+        if sku_specific:
+            return sku_specific[0]
+        category_specific = [s for s in self.strategies.values() if (s.scope_category and isinstance(s.scope_category, str) and s.scope_category.strip() == category)]
+        if category_specific:
+            return category_specific[0]
+        default = [s for s in self.strategies.values() if not (s.scope_category and isinstance(s.scope_category, str) and s.scope_category.strip()) and not (s.scope_sku and isinstance(s.scope_sku, str) and s.scope_sku.strip())]
+        if default:
+            return default[0]
+        return None
 
     def add_products_from_dataframe(self, df: pd.DataFrame):
         for _, row in df.iterrows():
@@ -155,6 +263,7 @@ class DataStore:
                 min_order_qty=int(row.get("min_order_qty", self.config["default_min_order_qty"])),
                 turnover_days=int(row.get("turnover_days", self.config["default_turnover_days"])),
                 unit_cost=float(row.get("unit_cost", 0.0)),
+                strategy_id=str(row.get("strategy_id", "")),
             )
             self.products[sku] = product
 
@@ -167,6 +276,8 @@ class DataStore:
                 store_id=store_id,
                 name=str(row.get("name", store_id)),
                 region=str(row.get("region", "")),
+                store_type=str(row.get("store_type", "")),
+                group_name=str(row.get("group_name", "")),
                 address=str(row.get("address", "")),
             )
             self.stores[store_id] = store
@@ -197,13 +308,18 @@ class DataStore:
 
     def add_promotions_from_dataframe(self, df: pd.DataFrame):
         for _, row in df.iterrows():
+            store_id_val = str(row.get("store_id", "")).strip()
+            if not store_id_val or store_id_val.lower() == "nan":
+                store_id_val = ""
+            is_all = not store_id_val
             record = PromotionRecord(
                 sku=str(row.get("sku", "")).strip(),
                 promo_type=str(row.get("promo_type", "")).strip(),
                 start_date=str(row.get("start_date", "")).strip(),
                 end_date=str(row.get("end_date", "")).strip(),
                 uplift_factor=float(row.get("uplift_factor", 1.5)),
-                store_id=str(row.get("store_id", "")).strip(),
+                store_id=store_id_val,
+                is_all_stores=is_all,
             )
             if record.sku and record.start_date and record.end_date:
                 self.promotions.append(record)

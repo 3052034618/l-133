@@ -4,8 +4,9 @@ import click
 import pandas as pd
 from tabulate import tabulate
 from datetime import datetime
+from typing import List, Optional
 
-from .storage import get_store
+from .storage import get_store, ReplenishmentStrategy, DataQualityIssue
 from .forecasting import Forecaster
 from .suggestion import SuggestionEngine
 
@@ -27,18 +28,18 @@ def _read_csv_or_excel(filepath: str) -> pd.DataFrame:
 
 
 @click.group()
-@click.version_option(version="1.0.0", prog_name="retail-replenish")
+@click.version_option(version="2.0.0", prog_name="retail-replenish")
 def cli():
-    """智慧零售补货建议命令行工具 - 批量分析门店缺货风险"""
+    """智慧零售补货建议命令行工具 v2.0 - 批量分析门店缺货风险"""
     pass
 
 
 @cli.command("import-sales")
 @click.argument("filepath", type=click.Path(exists=True, dir_okay=False))
 @click.option("--products", "products_file", type=click.Path(exists=True, dir_okay=False),
-              help="商品主数据文件（可选，包含SKU、名称、品类、起订量等）")
+              help="商品主数据文件（可选，包含SKU、名称、品类、起订量、策略ID等）")
 @click.option("--stores", "stores_file", type=click.Path(exists=True, dir_okay=False),
-              help="门店主数据文件（可选）")
+              help="门店主数据文件（可选，包含门店ID、名称、区域、类型等）")
 @click.option("--append/--replace", default=False,
               help="追加模式或替换模式（默认替换）")
 def import_sales(filepath, products_file, stores_file, append):
@@ -89,17 +90,21 @@ def import_sales(filepath, products_file, stores_file, append):
 @click.option("--stock", "stock_file", type=click.Path(exists=True, dir_okay=False),
               help="库存数据文件，包含列：store_id, sku, current_stock, in_transit, safety_stock")
 @click.option("--promotions", "promo_file", type=click.Path(exists=True, dir_okay=False),
-              help="促销日历文件，包含列：sku, promo_type, start_date, end_date, uplift_factor, store_id")
+              help="促销日历文件，包含列：sku, promo_type, start_date, end_date, uplift_factor, store_id（store_id为空表示全门店）")
 @click.option("--holiday-factor", type=float, default=None,
               help="节假日需求系数（如1.3表示节假日销量为平日130%）")
 @click.option("--min-order-qty", type=int, default=None,
               help="全局默认最低起订量")
 @click.option("--turnover-days", type=int, default=None,
               help="全局默认周转天数")
+@click.option("--lead-time-days", type=int, default=None,
+              help="全局默认补货提前期天数")
+@click.option("--service-level", type=float, default=None,
+              help="全局默认服务水平（0-1，如0.95表示95%）")
 @click.option("--append/--replace", default=False,
               help="追加模式或替换模式（默认替换）")
 def import_stock(stock_file, promo_file, holiday_factor, min_order_qty,
-                 turnover_days, append):
+                 turnover_days, lead_time_days, service_level, append):
     """导入库存、在途、安全库存、促销日历及参数配置"""
     store = get_store()
 
@@ -115,6 +120,14 @@ def import_stock(stock_file, promo_file, holiday_factor, min_order_qty,
         if turnover_days is not None:
             store.config["default_turnover_days"] = turnover_days
             click.echo(f"✓ 设置默认周转天数: {turnover_days}")
+
+        if lead_time_days is not None:
+            store.config["default_lead_time_days"] = lead_time_days
+            click.echo(f"✓ 设置默认补货提前期: {lead_time_days}天")
+
+        if service_level is not None:
+            store.config["default_service_level"] = service_level
+            click.echo(f"✓ 设置默认服务水平: {service_level:.0%}")
 
         if not append:
             store.clear_stock_data()
@@ -152,9 +165,170 @@ def import_stock(stock_file, promo_file, holiday_factor, min_order_qty,
                 df_promo["store_id"] = ""
 
             store.add_promotions_from_dataframe(df_promo)
+            all_store_count = sum(1 for p in store.promotions if p.is_all_stores)
             click.echo(f"✓ 导入促销日历: {len(df_promo)} 条")
+            click.echo(f"  全门店活动: {all_store_count} 条，指定门店活动: {len(df_promo) - all_store_count} 条")
 
         store.save()
+
+    except Exception as e:
+        click.echo(f"✗ 导入失败: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.group("strategy")
+def strategy_group():
+    """补货策略模板管理"""
+    pass
+
+
+@strategy_group.command("create")
+@click.option("--id", "strategy_id", required=True, help="策略ID")
+@click.option("--name", required=True, help="策略名称")
+@click.option("--service-level", type=float, default=0.95, help="服务水平 (0-1)，默认0.95")
+@click.option("--lead-time", type=int, default=3, help="补货提前期天数，默认3")
+@click.option("--turnover-days", type=int, default=7, help="目标周转天数，默认7")
+@click.option("--min-order-qty", type=int, default=1, help="最低起订量，默认1")
+@click.option("--rounding", type=click.Choice(["ceiling", "floor", "round"]), default="ceiling",
+              help="起订量取整方式：向上取整/向下取整/四舍五入，默认向上取整")
+@click.option("--safety-factor", type=float, default=1.5, help="安全库存系数，默认1.5")
+@click.option("--scope-category", default="", help="适用品类（为空表示所有品类）")
+@click.option("--scope-sku", default="", help="适用SKU（为空表示所有SKU，优先级高于品类）")
+@click.option("--description", default="", help="策略描述")
+def strategy_create(strategy_id, name, service_level, lead_time, turnover_days,
+                    min_order_qty, rounding, safety_factor, scope_category, scope_sku, description):
+    """创建补货策略模板"""
+    store = get_store()
+    try:
+        strategy = ReplenishmentStrategy(
+            strategy_id=strategy_id,
+            name=name,
+            service_level=service_level,
+            lead_time_days=lead_time,
+            target_turnover_days=turnover_days,
+            min_order_qty=min_order_qty,
+            order_rounding=rounding,
+            safety_stock_factor=safety_factor,
+            scope_category=scope_category,
+            scope_sku=scope_sku,
+            description=description,
+        )
+        store.add_strategy(strategy)
+        store.save()
+        click.echo(f"✓ 已创建策略: {strategy_id} - {name}")
+        click.echo(f"  服务水平: {service_level:.0%}")
+        click.echo(f"  补货提前期: {lead_time}天")
+        click.echo(f"  目标周转: {turnover_days}天")
+        click.echo(f"  最低起订量: {min_order_qty}")
+        click.echo(f"  取整方式: {rounding}")
+        if scope_sku:
+            click.echo(f"  适用SKU: {scope_sku}")
+        elif scope_category:
+            click.echo(f"  适用品类: {scope_category}")
+        else:
+            click.echo(f"  适用范围: 全部商品")
+    except Exception as e:
+        click.echo(f"✗ 创建失败: {e}", err=True)
+        sys.exit(1)
+
+
+@strategy_group.command("list")
+def strategy_list():
+    """列出所有补货策略模板"""
+    store = get_store()
+    if not store.strategies:
+        click.echo("⚠ 暂无策略模板")
+        return
+
+    data = []
+    for s in store.strategies.values():
+        sku_scope = s.scope_sku if isinstance(s.scope_sku, str) and s.scope_sku.strip() else ""
+        cat_scope = s.scope_category if isinstance(s.scope_category, str) and s.scope_category.strip() else ""
+        scope = sku_scope if sku_scope else (cat_scope if cat_scope else "全部")
+        data.append({
+            "策略ID": s.strategy_id,
+            "策略名称": s.name,
+            "服务水平": f"{s.service_level:.0%}",
+            "提前期(天)": s.lead_time_days,
+            "周转天数": s.target_turnover_days,
+            "起订量": s.min_order_qty,
+            "取整方式": s.order_rounding,
+            "适用范围": scope,
+            "描述": s.description,
+        })
+
+    df = pd.DataFrame(data)
+    click.echo(tabulate(df, headers="keys", tablefmt="grid", showindex=False))
+
+
+@strategy_group.command("delete")
+@click.argument("strategy_id")
+def strategy_delete(strategy_id):
+    """删除指定补货策略模板"""
+    store = get_store()
+    if strategy_id not in store.strategies:
+        click.echo(f"✗ 策略不存在: {strategy_id}", err=True)
+        sys.exit(1)
+
+    store.remove_strategy(strategy_id)
+    store.save()
+    click.echo(f"✓ 已删除策略: {strategy_id}")
+
+
+@strategy_group.command("import")
+@click.argument("filepath", type=click.Path(exists=True, dir_okay=False))
+@click.option("--append/--replace", default=False, help="追加或替换现有策略")
+def strategy_import(filepath, append):
+    """从文件批量导入补货策略模板"""
+    store = get_store()
+    try:
+        df = _read_csv_or_excel(filepath)
+        required_cols = {"strategy_id", "name"}
+        missing = required_cols - set(df.columns.str.lower())
+        if missing:
+            raise click.BadParameter(f"策略文件缺少必要列: {', '.join(missing)}")
+
+        df.columns = df.columns.str.lower()
+
+        if not append:
+            store.strategies = {}
+
+        count = 0
+        for _, row in df.iterrows():
+            def _safe_str(val):
+                s = str(val) if val is not None else ""
+                return "" if s.lower() == "nan" else s.strip()
+
+            def _safe_float(val, default):
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return default
+
+            def _safe_int(val, default):
+                try:
+                    return int(float(val))
+                except (ValueError, TypeError):
+                    return default
+
+            strategy = ReplenishmentStrategy(
+                strategy_id=_safe_str(row["strategy_id"]),
+                name=_safe_str(row["name"]),
+                service_level=_safe_float(row.get("service_level"), 0.95),
+                lead_time_days=_safe_int(row.get("lead_time_days"), 3),
+                target_turnover_days=_safe_int(row.get("target_turnover_days"), 7),
+                min_order_qty=_safe_int(row.get("min_order_qty"), 1),
+                order_rounding=_safe_str(row.get("order_rounding", "ceiling")),
+                safety_stock_factor=_safe_float(row.get("safety_stock_factor"), 1.5),
+                scope_category=_safe_str(row.get("scope_category", "")),
+                scope_sku=_safe_str(row.get("scope_sku", "")),
+                description=_safe_str(row.get("description", "")),
+            )
+            store.add_strategy(strategy)
+            count += 1
+
+        store.save()
+        click.echo(f"✓ 已导入 {count} 条策略模板")
 
     except Exception as e:
         click.echo(f"✗ 导入失败: {e}", err=True)
@@ -171,9 +345,11 @@ def import_stock(stock_file, promo_file, holiday_factor, min_order_qty,
 @click.option("--limit", type=int, default=50,
               help="显示前N条结果")
 @click.option("--summary", is_flag=True, default=False,
-              help="仅显示7天汇总")
-def forecast_cmd(group_by, start_date, days, limit, summary):
-    """生成未来七天需求预测，按门店、品类或商品维度"""
+              help="仅显示7天汇总（按选择的维度汇总）")
+@click.option("--show-increment", is_flag=True, default=True,
+              help="显示促销增量和假日增量（默认开启）")
+def forecast_cmd(group_by, start_date, days, limit, summary, show_increment):
+    """生成未来七天需求预测，按门店、品类或商品维度，明细和汇总维度一致"""
     store = get_store()
 
     if not store.sales:
@@ -190,33 +366,27 @@ def forecast_cmd(group_by, start_date, days, limit, summary):
             click.echo("⚠ 未生成有效预测，请检查数据")
             return
 
-        click.echo(f"✓ 已生成 {len(forecasts)} 条预测记录")
+        click.echo(f"✓ 已生成 {len(forecasts)} 条预测记录 (维度: {group_by})")
+
+        active_promos = sum(1 for f in forecasts if f.promo_increment > 0)
+        holiday_effect = sum(1 for f in forecasts if f.holiday_increment > 0)
+        if active_promos > 0:
+            click.echo(f"  含活动增量的预测: {active_promos} 条")
+        if holiday_effect > 0:
+            click.echo(f"  含假日增量的预测: {holiday_effect} 条")
 
         if summary:
-            summary_df = forecaster.get_7day_summary(forecasts)
-            summary_df = summary_df.merge(
-                pd.DataFrame([{
-                    "sku": p.sku,
-                    "商品名称": p.name,
-                    "品类": p.category,
-                } for p in store.products.values()]),
-                on="sku", how="left"
-            )
-            summary_df = summary_df.merge(
-                pd.DataFrame([{
-                    "store_id": s.store_id,
-                    "门店名称": s.name,
-                } for s in store.stores.values()]),
-                on="store_id", how="left"
-            )
-            summary_df = summary_df.rename(columns={
-                "store_id": "门店ID", "sku": "商品SKU", "forecast_7d": "7天预测需求"
-            })
-            summary_df = summary_df[["门店ID", "门店名称", "商品SKU", "商品名称", "品类", "7天预测需求"]]
-            summary_df = summary_df.sort_values("7天预测需求", ascending=False).head(limit)
+            summary_df = forecaster.get_7day_summary(forecasts, group_by=group_by)
+            if not show_increment:
+                cols_to_keep = [c for c in summary_df.columns if "增量" not in c and "基准" not in c]
+                summary_df = summary_df[cols_to_keep]
+            summary_df = summary_df.sort_values("7天预测需求", ascending=False).head(limit) if "7天预测需求" in summary_df.columns else summary_df.head(limit)
             click.echo(tabulate(summary_df, headers="keys", tablefmt="grid", showindex=False, floatfmt=".1f"))
         else:
             df = forecaster.aggregate_forecasts(forecasts, group_by)
+            if not show_increment:
+                cols_to_keep = [c for c in df.columns if "增量" not in c and "基准" not in c]
+                df = df[cols_to_keep]
             if limit:
                 df = df.head(limit)
             click.echo(tabulate(df, headers="keys", tablefmt="grid", showindex=False, floatfmt=".1f"))
@@ -226,21 +396,12 @@ def forecast_cmd(group_by, start_date, days, limit, summary):
         sys.exit(1)
 
 
-@cli.command("suggest")
-@click.option("--risk", type=click.Choice(["高", "中", "低"]), default=None,
-              help="按缺货风险等级筛选")
-@click.option("--need-replenish", is_flag=True, default=False,
-              help="仅显示需要补货的商品")
-@click.option("--stagnant", is_flag=True, default=False,
-              help="仅显示有滞销风险的商品")
-@click.option("--store", "store_id", type=str, default=None,
-              help="按门店ID筛选")
-@click.option("--sku", type=str, default=None,
-              help="按商品SKU筛选")
-@click.option("--limit", type=int, default=50,
-              help="显示前N条结果")
-def suggest_cmd(risk, need_replenish, stagnant, store_id, sku, limit):
-    """输出建议补货量、缺货风险等级、滞销提示和可调拨门店"""
+@cli.command("transfer-simulate")
+@click.option("--group-by", type=click.Choice(["region", "store_type", "group_name", "all"]),
+              default="region", help="门店群组维度：区域、门店类型、自定义组、全部")
+@click.option("--limit", type=int, default=30, help="显示前N条调拨建议")
+def transfer_simulate(group_by, limit):
+    """门店群组调拨模拟 - 按区域/类型查看缺货和富余，生成调拨优先级"""
     store = get_store()
 
     if not store.forecasts:
@@ -254,7 +415,79 @@ def suggest_cmd(risk, need_replenish, stagnant, store_id, sku, limit):
 
     try:
         engine = SuggestionEngine(store)
-        suggestions = engine.generate_suggestions()
+
+        click.echo("=== 门店群组分析 ===")
+        analysis_df = engine.get_group_analysis(group_by)
+        click.echo(tabulate(analysis_df, headers="keys", tablefmt="grid", showindex=False, floatfmt=".1f"))
+        click.echo("")
+
+        click.echo("=== 调拨建议（按优先级） ===")
+        transfers = engine.generate_transfer_suggestions(group_by)
+
+        if not transfers:
+            click.echo("⚠ 未发现可调拨机会")
+            return
+
+        click.echo(f"✓ 共生成 {len(transfers)} 条调拨建议")
+
+        df = engine.transfers_to_dataframe(transfers)
+        if limit:
+            df = df.head(limit)
+
+        priority_summary = pd.DataFrame([
+            {"优先级区间": "≥15", "数量": len([t for t in transfers if t.priority >= 15])},
+            {"优先级区间": "10-14", "数量": len([t for t in transfers if 10 <= t.priority < 15])},
+            {"优先级区间": "5-9", "数量": len([t for t in transfers if 5 <= t.priority < 10])},
+            {"优先级区间": "<5", "数量": len([t for t in transfers if t.priority < 5])},
+        ])
+        click.echo(tabulate(priority_summary, headers="keys", tablefmt="grid", showindex=False))
+        click.echo("")
+
+        click.echo(tabulate(df, headers="keys", tablefmt="grid", showindex=False))
+
+    except Exception as e:
+        click.echo(f"✗ 调拨模拟失败: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command("suggest")
+@click.option("--strategy", "strategy_id", default=None,
+              help="指定策略ID（不指定则自动匹配商品/品类绑定的策略）")
+@click.option("--risk", type=click.Choice(["高", "中", "低"]), default=None,
+              help="按缺货风险等级筛选")
+@click.option("--need-replenish", is_flag=True, default=False,
+              help="仅显示需要补货的商品")
+@click.option("--stagnant", is_flag=True, default=False,
+              help="仅显示有滞销风险的商品")
+@click.option("--store", "store_id", type=str, default=None,
+              help="按门店ID筛选")
+@click.option("--sku", type=str, default=None,
+              help="按商品SKU筛选")
+@click.option("--category", type=str, default=None,
+              help="按品类筛选")
+@click.option("--region", type=str, default=None,
+              help="按区域筛选")
+@click.option("--limit", type=int, default=50,
+              help="显示前N条结果")
+@click.option("--show-strategy", is_flag=True, default=True,
+              help="显示使用的策略名称（默认开启）")
+def suggest_cmd(strategy_id, risk, need_replenish, stagnant, store_id, sku,
+                category, region, limit, show_strategy):
+    """输出建议补货量、缺货风险等级、滞销提示和可调拨门店，可选择策略模板"""
+    store = get_store()
+
+    if not store.forecasts:
+        click.echo("⚠ 未检测到预测数据，自动执行预测...")
+        forecaster = Forecaster(store)
+        forecaster.generate_forecast()
+
+    if not store.stocks:
+        click.echo("✗ 请先导入库存数据 (import-stock)", err=True)
+        sys.exit(1)
+
+    try:
+        engine = SuggestionEngine(store)
+        suggestions = engine.generate_suggestions(strategy_id=strategy_id)
 
         if not suggestions:
             click.echo("⚠ 未生成有效建议，请检查数据")
@@ -263,15 +496,15 @@ def suggest_cmd(risk, need_replenish, stagnant, store_id, sku, limit):
         suggestions = engine.filter_suggestions(
             suggestions, risk_filter=risk,
             need_replenish_only=need_replenish,
-            stagnant_only=stagnant
+            stagnant_only=stagnant,
+            store_id=store_id,
+            sku=sku,
+            category=category,
+            region=region,
         )
 
-        if store_id:
-            suggestions = [s for s in suggestions if s.store_id == store_id]
-        if sku:
-            suggestions = [s for s in suggestions if s.sku == sku]
-
         click.echo(f"✓ 共生成 {len(suggestions)} 条补货建议")
+        click.echo(f"  使用策略: {engine.current_strategy}")
 
         if not suggestions:
             return
@@ -286,12 +519,23 @@ def suggest_cmd(risk, need_replenish, stagnant, store_id, sku, limit):
         click.echo(f"  风险分布: 高={stats['高风险']} 中={stats['中风险']} 低={stats['低风险']}")
         click.echo(f"  需补货: {stats['需补货']} 条，滞销预警: {stats['滞销预警']} 条")
 
+        strategy_stats = {}
+        for s in suggestions:
+            key = s.strategy_name or "默认策略"
+            strategy_stats[key] = strategy_stats.get(key, 0) + 1
+        if len(strategy_stats) > 1:
+            click.echo(f"  策略分布: {', '.join([f'{k}={v}' for k, v in strategy_stats.items()])}")
+
         df = engine.suggestions_to_dataframe(suggestions)
         if limit:
             df = df.head(limit)
 
-        columns = ["门店名称", "商品名称", "品类", "当前库存", "在途数量", "安全库存",
-                   "7天预测需求", "缺货风险等级", "建议补货量", "滞销提示", "可调拨门店", "建议原因"]
+        columns = ["门店名称", "区域", "商品名称", "品类", "当前库存", "在途数量", "安全库存",
+                   "7天预测需求", "缺货风险等级", "建议补货量", "滞销提示", "可调拨门店"]
+        if show_strategy:
+            columns.insert(len(columns) - 1, "使用策略")
+        columns.append("建议原因")
+
         available_cols = [c for c in columns if c in df.columns]
         df = df[available_cols]
 
@@ -310,12 +554,17 @@ def suggest_cmd(risk, need_replenish, stagnant, store_id, sku, limit):
               default="all", help="导出类型：采购清单(purchase)、配送清单(delivery)、全部(all)")
 @click.option("--risk", type=click.Choice(["高", "中", "低", "all"]), default="all",
               help="按风险等级筛选")
-@click.option("--need-replenish", is_flag=True, default=True,
+@click.option("--need-replenish/--all-items", default=True,
               help="仅导出需要补货的商品（默认开启）")
 @click.option("--include-forecast", is_flag=True, default=True,
-              help="包含预测数据")
-def export_cmd(output, fmt, export_type, risk, need_replenish, include_forecast):
-    """导出给采购或配送团队使用的清单
+              help="包含预测数据（按forecast最后使用的维度）")
+@click.option("--include-transfer", is_flag=True, default=True,
+              help="包含调拨建议")
+@click.option("--forecast-group-by", type=click.Choice(["sku", "store", "category"]), default=None,
+              help="强制指定预测明细的汇总维度（不指定则使用最近一次forecast的维度）")
+def export_cmd(output, fmt, export_type, risk, need_replenish, include_forecast,
+               include_transfer, forecast_group_by):
+    """导出给采购或配送团队使用的清单，CSV和Excel都支持三种口径
 
     OUTPUT: 输出文件路径
     """
@@ -344,6 +593,11 @@ def export_cmd(output, fmt, export_type, risk, need_replenish, include_forecast)
                 fmt = "xlsx"
             else:
                 fmt = "csv"
+        else:
+            if fmt == "xlsx":
+                ext = os.path.splitext(output)[1].lower().lstrip(".")
+                if ext not in ("xlsx", "xls"):
+                    output = output + ".xlsx"
 
         engine = SuggestionEngine(store)
         suggestions = store.suggestions
@@ -356,11 +610,23 @@ def export_cmd(output, fmt, export_type, risk, need_replenish, include_forecast)
 
         df = engine.suggestions_to_dataframe(suggestions)
 
+        if df.empty:
+            click.echo("⚠ 筛选后无数据可导出")
+            return
+
+        if include_transfer and store.transfer_suggestions:
+            transfer_df = engine.transfers_to_dataframe(store.transfer_suggestions)
+            click.echo(f"✓ 包含 {len(store.transfer_suggestions)} 条调拨建议")
+
+        forecaster = Forecaster(store)
+        group_by = forecast_group_by or forecaster.last_group_by
+
         if include_forecast and store.forecasts:
-            forecaster = Forecaster(store)
-            forecast_df = forecaster.get_7day_summary(store.forecasts)
-            if not forecast_df.empty:
-                click.echo(f"✓ 包含 {len(store.forecasts)} 条预测明细")
+            forecast_export_df = forecaster.get_detailed_forecast_export(store.forecasts, group_by=group_by)
+            if not forecast_export_df.empty:
+                click.echo(f"✓ 包含 {len(store.forecasts)} 条预测明细 (维度: {group_by})")
+
+        base, ext = os.path.splitext(output)
 
         if fmt == "xlsx":
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -369,27 +635,28 @@ def export_cmd(output, fmt, export_type, risk, need_replenish, include_forecast)
                     purchase_df = df.groupby(["商品SKU", "商品名称", "品类"], as_index=False)["建议补货量"].sum()
                     purchase_df = purchase_df[purchase_df["建议补货量"] > 0]
                     purchase_df = purchase_df.rename(columns={"建议补货量": "建议采购量"})
+                    purchase_df = purchase_df.sort_values("建议采购量", ascending=False)
                     purchase_df.to_excel(writer, sheet_name="采购清单", index=False)
+                    click.echo(f"  采购清单: {len(purchase_df)} 个SKU，采购总量: {int(purchase_df['建议采购量'].sum())}")
 
                 if export_type in ("delivery", "all"):
-                    delivery_cols = ["门店ID", "门店名称", "商品SKU", "商品名称", "品类",
+                    delivery_cols = ["门店ID", "门店名称", "区域", "门店类型", "商品SKU", "商品名称", "品类",
                                      "当前库存", "在途数量", "安全库存", "7天预测需求",
-                                     "缺货风险等级", "建议补货量", "可调拨门店", "建议原因"]
+                                     "缺货风险等级", "建议补货量", "使用策略", "可调拨门店", "建议原因"]
                     delivery_df = df[[c for c in delivery_cols if c in df.columns]]
-                    delivery_df = delivery_df.sort_values(["缺货风险等级", "门店名称"], ascending=[False, True])
+                    delivery_df = delivery_df.sort_values(
+                        ["缺货风险等级", "区域", "门店名称"],
+                        ascending=[False, True, True],
+                        key=lambda x: x.map({"高": 0, "中": 1, "低": 2}) if x.name == "缺货风险等级" else x
+                    )
                     delivery_df.to_excel(writer, sheet_name="配送清单", index=False)
+                    click.echo(f"  配送清单: {len(delivery_df)} 条记录")
 
                 if include_forecast and store.forecasts:
-                    forecast_data = [{
-                        "门店ID": f.store_id,
-                        "门店名称": store.stores.get(f.store_id).name if store.stores.get(f.store_id) else f.store_id,
-                        "商品SKU": f.sku,
-                        "商品名称": store.products.get(f.sku).name if store.products.get(f.sku) else f.sku,
-                        "预测日期": f.forecast_date,
-                        "预测数量": f.forecast_qty,
-                    } for f in store.forecasts]
-                    forecast_df = pd.DataFrame(forecast_data)
-                    forecast_df.to_excel(writer, sheet_name="需求预测明细", index=False)
+                    forecast_export_df.to_excel(writer, sheet_name=f"需求预测({group_by})", index=False)
+
+                if include_transfer and store.transfer_suggestions:
+                    transfer_df.to_excel(writer, sheet_name="调拨建议", index=False)
 
                 summary_data = []
                 for risk_lvl in ["高", "中", "低"]:
@@ -397,16 +664,323 @@ def export_cmd(output, fmt, export_type, risk, need_replenish, include_forecast)
                     qty = int(df[df["缺货风险等级"] == risk_lvl]["建议补货量"].sum())
                     summary_data.append({"风险等级": risk_lvl, "SKU数量": count, "建议补货总量": qty})
                 pd.DataFrame(summary_data).to_excel(writer, sheet_name="汇总概览", index=False)
-        else:
-            df.to_csv(output, index=False, encoding="utf-8-sig")
 
-        click.echo(f"✓ 已导出到: {output}")
-        click.echo(f"  共 {len(df)} 条记录")
-        if not df.empty:
-            click.echo(f"  建议补货总量: {int(df['建议补货量'].sum())}")
+                if export_type == "all":
+                    strategy_summary = df.groupby(["使用策略"], as_index=False).agg({
+                        "商品SKU": "count",
+                        "建议补货量": "sum"
+                    })
+                    strategy_summary = strategy_summary.rename(columns={"商品SKU": "SKU数量", "建议补货量": "补货总量"})
+                    strategy_summary.to_excel(writer, sheet_name="策略汇总", index=False)
+        else:
+            if export_type == "all":
+                if export_type in ("purchase", "all"):
+                    purchase_file = f"{base}_采购.{fmt}"
+                    purchase_cols = ["商品SKU", "商品名称", "品类", "建议补货量"]
+                    purchase_df = df.groupby(["商品SKU", "商品名称", "品类"], as_index=False)["建议补货量"].sum()
+                    purchase_df = purchase_df[purchase_df["建议补货量"] > 0]
+                    purchase_df = purchase_df.rename(columns={"建议补货量": "建议采购量"})
+                    purchase_df = purchase_df.sort_values("建议采购量", ascending=False)
+                    purchase_df.to_csv(purchase_file, index=False, encoding="utf-8-sig")
+                    click.echo(f"✓ 采购清单已导出到: {purchase_file} ({len(purchase_df)} 个SKU)")
+
+                if export_type in ("delivery", "all"):
+                    delivery_file = f"{base}_配送.{fmt}"
+                    delivery_cols = ["门店ID", "门店名称", "区域", "门店类型", "商品SKU", "商品名称", "品类",
+                                     "当前库存", "在途数量", "安全库存", "7天预测需求",
+                                     "缺货风险等级", "建议补货量", "使用策略", "可调拨门店", "建议原因"]
+                    delivery_df = df[[c for c in delivery_cols if c in df.columns]]
+                    delivery_df = delivery_df.sort_values(
+                        ["缺货风险等级", "区域", "门店名称"],
+                        ascending=[False, True, True],
+                        key=lambda x: x.map({"高": 0, "中": 1, "低": 2}) if x.name == "缺货风险等级" else x
+                    )
+                    delivery_df.to_csv(delivery_file, index=False, encoding="utf-8-sig")
+                    click.echo(f"✓ 配送清单已导出到: {delivery_file} ({len(delivery_df)} 条记录)")
+
+                if include_forecast and store.forecasts:
+                    forecast_file = f"{base}_预测.{fmt}"
+                    forecast_export_df.to_csv(forecast_file, index=False, encoding="utf-8-sig")
+                    click.echo(f"✓ 预测明细已导出到: {forecast_file} ({len(forecast_export_df)} 条记录)")
+
+                if include_transfer and store.transfer_suggestions:
+                    transfer_file = f"{base}_调拨.{fmt}"
+                    transfer_df.to_csv(transfer_file, index=False, encoding="utf-8-sig")
+                    click.echo(f"✓ 调拨建议已导出到: {transfer_file} ({len(transfer_df)} 条记录)")
+            else:
+                if export_type == "purchase":
+                    purchase_cols = ["商品SKU", "商品名称", "品类", "建议补货量"]
+                    purchase_df = df.groupby(["商品SKU", "商品名称", "品类"], as_index=False)["建议补货量"].sum()
+                    purchase_df = purchase_df[purchase_df["建议补货量"] > 0]
+                    purchase_df = purchase_df.rename(columns={"建议补货量": "建议采购量"})
+                    purchase_df = purchase_df.sort_values("建议采购量", ascending=False)
+                    purchase_df.to_csv(output, index=False, encoding="utf-8-sig")
+                    click.echo(f"✓ 已导出到: {output}")
+                    click.echo(f"  共 {len(purchase_df)} 个SKU")
+                    click.echo(f"  建议采购总量: {int(purchase_df['建议采购量'].sum())}")
+                elif export_type == "delivery":
+                    delivery_cols = ["门店ID", "门店名称", "区域", "门店类型", "商品SKU", "商品名称", "品类",
+                                     "当前库存", "在途数量", "安全库存", "7天预测需求",
+                                     "缺货风险等级", "建议补货量", "使用策略", "可调拨门店", "建议原因"]
+                    delivery_df = df[[c for c in delivery_cols if c in df.columns]]
+                    delivery_df = delivery_df.sort_values(
+                        ["缺货风险等级", "区域", "门店名称"],
+                        ascending=[False, True, True],
+                        key=lambda x: x.map({"高": 0, "中": 1, "低": 2}) if x.name == "缺货风险等级" else x
+                    )
+                    delivery_df.to_csv(output, index=False, encoding="utf-8-sig")
+                    click.echo(f"✓ 已导出到: {output}")
+                    click.echo(f"  共 {len(delivery_df)} 条记录")
+
+        if fmt == "xlsx":
+            click.echo(f"✓ 已导出到: {output}")
+            click.echo(f"  共 {len(df)} 条记录")
+            if not df.empty:
+                click.echo(f"  建议补货总量: {int(df['建议补货量'].sum())}")
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         click.echo(f"✗ 导出失败: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command("data-quality")
+@click.option("--export", "export_path", type=click.Path(dir_okay=False), default=None,
+              help="导出异常清单到文件")
+@click.option("--fix/--no-fix", default=False,
+              help="自动修复可修正的问题（如负库存置零）")
+def data_quality_cmd(export_path, fix):
+    """数据质量检查 - 列出缺少主数据、负库存、重复销量、日期格式等问题"""
+    store = get_store()
+    issues: List[DataQualityIssue] = []
+
+    try:
+        click.echo("=== 开始数据质量检查 ===")
+
+        sku_set = set(store.products.keys())
+        store_set = set(store.stores.keys())
+
+        for idx, sale in enumerate(store.sales):
+            if sale.sku not in sku_set:
+                issues.append(DataQualityIssue(
+                    issue_type="缺少商品主数据",
+                    severity="中",
+                    table_name="销量数据",
+                    record_key=f"{sale.store_id}-{sale.sku}-{sale.sale_date}",
+                    description=f"销量第{idx+1}条：SKU {sale.sku} 不存在于商品主数据",
+                ))
+            if sale.store_id not in store_set:
+                issues.append(DataQualityIssue(
+                    issue_type="缺少门店主数据",
+                    severity="中",
+                    table_name="销量数据",
+                    record_key=f"{sale.store_id}-{sale.sku}-{sale.sale_date}",
+                    description=f"销量第{idx+1}条：门店 {sale.store_id} 不存在于门店主数据",
+                ))
+            if sale.quantity < 0:
+                issues.append(DataQualityIssue(
+                    issue_type="负销量",
+                    severity="高",
+                    table_name="销量数据",
+                    record_key=f"{sale.store_id}-{sale.sku}-{sale.sale_date}",
+                    description=f"销量第{idx+1}条：销售数量 {sale.quantity} 为负数",
+                ))
+            try:
+                datetime.strptime(sale.sale_date, "%Y-%m-%d")
+            except ValueError:
+                issues.append(DataQualityIssue(
+                    issue_type="日期格式错误",
+                    severity="高",
+                    table_name="销量数据",
+                    record_key=f"{sale.store_id}-{sale.sku}-{sale.sale_date}",
+                    description=f"销量第{idx+1}条：日期 {sale.sale_date} 格式不正确，应为 YYYY-MM-DD",
+                ))
+
+        seen_sales = {}
+        for idx, sale in enumerate(store.sales):
+            key = (sale.store_id, sale.sku, sale.sale_date)
+            if key in seen_sales:
+                issues.append(DataQualityIssue(
+                    issue_type="重复销量记录",
+                    severity="中",
+                    table_name="销量数据",
+                    record_key=f"{sale.store_id}-{sale.sku}-{sale.sale_date}",
+                    description=f"销量第{idx+1}条：与第{seen_sales[key]+1}条重复 (同门店同SKU同日期)",
+                ))
+            else:
+                seen_sales[key] = idx
+
+        for idx, stock in enumerate(store.stocks):
+            if stock.sku not in sku_set:
+                issues.append(DataQualityIssue(
+                    issue_type="缺少商品主数据",
+                    severity="中",
+                    table_name="库存数据",
+                    record_key=f"{stock.store_id}-{stock.sku}",
+                    description=f"库存第{idx+1}条：SKU {stock.sku} 不存在于商品主数据",
+                ))
+            if stock.store_id not in store_set:
+                issues.append(DataQualityIssue(
+                    issue_type="缺少门店主数据",
+                    severity="中",
+                    table_name="库存数据",
+                    record_key=f"{stock.store_id}-{stock.sku}",
+                    description=f"库存第{idx+1}条：门店 {stock.store_id} 不存在于门店主数据",
+                ))
+            if stock.current_stock < 0:
+                issues.append(DataQualityIssue(
+                    issue_type="负库存",
+                    severity="高",
+                    table_name="库存数据",
+                    record_key=f"{stock.store_id}-{stock.sku}",
+                    description=f"库存第{idx+1}条：当前库存 {stock.current_stock} 为负数",
+                ))
+            if stock.in_transit < 0:
+                issues.append(DataQualityIssue(
+                    issue_type="负在途",
+                    severity="中",
+                    table_name="库存数据",
+                    record_key=f"{stock.store_id}-{stock.sku}",
+                    description=f"库存第{idx+1}条：在途数量 {stock.in_transit} 为负数",
+                ))
+            if stock.safety_stock < 0:
+                issues.append(DataQualityIssue(
+                    issue_type="负安全库存",
+                    severity="中",
+                    table_name="库存数据",
+                    record_key=f"{stock.store_id}-{stock.sku}",
+                    description=f"库存第{idx+1}条：安全库存 {stock.safety_stock} 为负数",
+                ))
+
+        for idx, promo in enumerate(store.promotions):
+            if promo.sku != "*" and promo.sku not in sku_set:
+                issues.append(DataQualityIssue(
+                    issue_type="缺少商品主数据",
+                    severity="低",
+                    table_name="促销日历",
+                    record_key=f"{promo.sku}-{promo.start_date}",
+                    description=f"促销第{idx+1}条：SKU {promo.sku} 不存在于商品主数据",
+                ))
+            if promo.store_id and promo.store_id not in store_set:
+                issues.append(DataQualityIssue(
+                    issue_type="缺少门店主数据",
+                    severity="低",
+                    table_name="促销日历",
+                    record_key=f"{promo.sku}-{promo.start_date}",
+                    description=f"促销第{idx+1}条：门店 {promo.store_id} 不存在于门店主数据",
+                ))
+            try:
+                start = datetime.strptime(promo.start_date, "%Y-%m-%d")
+                end = datetime.strptime(promo.end_date, "%Y-%m-%d")
+                if start > end:
+                    issues.append(DataQualityIssue(
+                        issue_type="日期逻辑错误",
+                        severity="高",
+                        table_name="促销日历",
+                        record_key=f"{promo.sku}-{promo.start_date}",
+                        description=f"促销第{idx+1}条：开始日期 {promo.start_date} 晚于结束日期 {promo.end_date}",
+                    ))
+            except ValueError:
+                issues.append(DataQualityIssue(
+                    issue_type="日期格式错误",
+                    severity="高",
+                    table_name="促销日历",
+                    record_key=f"{promo.sku}-{promo.start_date}",
+                    description=f"促销第{idx+1}条：日期格式不正确，应为 YYYY-MM-DD",
+                ))
+            if promo.uplift_factor < 1.0:
+                issues.append(DataQualityIssue(
+                    issue_type="促销系数异常",
+                    severity="中",
+                    table_name="促销日历",
+                    record_key=f"{promo.sku}-{promo.start_date}",
+                    description=f"促销第{idx+1}条：提升系数 {promo.uplift_factor} 小于1.0",
+                ))
+
+        for strategy_id, strategy in store.strategies.items():
+            if strategy.scope_category and not any(p.category == strategy.scope_category for p in store.products.values()):
+                issues.append(DataQualityIssue(
+                    issue_type="策略无匹配品类",
+                    severity="低",
+                    table_name="补货策略",
+                    record_key=strategy_id,
+                    description=f"策略 {strategy.name} 指定品类 {strategy.scope_category}，但无商品属于该品类",
+                ))
+            if strategy.scope_sku and strategy.scope_sku not in sku_set:
+                issues.append(DataQualityIssue(
+                    issue_type="策略无匹配SKU",
+                    severity="低",
+                    table_name="补货策略",
+                    record_key=strategy_id,
+                    description=f"策略 {strategy.name} 指定SKU {strategy.scope_sku}，但该SKU不存在",
+                ))
+
+        store.data_quality_issues = issues
+
+        severity_count = {"高": 0, "中": 0, "低": 0}
+        type_count = {}
+        for issue in issues:
+            severity_count[issue.severity] = severity_count.get(issue.severity, 0) + 1
+            type_count[issue.issue_type] = type_count.get(issue.issue_type, 0) + 1
+
+        click.echo(f"\n✓ 检查完成，共发现 {len(issues)} 个问题")
+        click.echo(f"  严重程度: 高={severity_count.get('高', 0)} 中={severity_count.get('中', 0)} 低={severity_count.get('低', 0)}")
+        click.echo("")
+        click.echo("=== 问题类型统计 ===")
+        type_df = pd.DataFrame([{"问题类型": k, "数量": v} for k, v in type_count.items()])
+        click.echo(tabulate(type_df, headers="keys", tablefmt="grid", showindex=False))
+
+        if issues:
+            click.echo("")
+            click.echo("=== 问题明细（前20条） ===")
+            display_issues = issues[:20]
+            issue_df = pd.DataFrame([{
+                "严重程度": i.severity,
+                "问题类型": i.issue_type,
+                "数据来源": i.table_name,
+                "记录标识": i.record_key,
+                "详细描述": i.description,
+            } for i in display_issues])
+            click.echo(tabulate(issue_df, headers="keys", tablefmt="grid", showindex=False))
+
+            if len(issues) > 20:
+                click.echo(f"  ... 还有 {len(issues) - 20} 条问题，请通过 --export 导出完整清单")
+
+        if fix:
+            fixed_count = 0
+            for stock in store.stocks:
+                if stock.current_stock < 0:
+                    stock.current_stock = 0
+                    fixed_count += 1
+                if stock.in_transit < 0:
+                    stock.in_transit = 0
+                    fixed_count += 1
+                if stock.safety_stock < 0:
+                    stock.safety_stock = 0
+                    fixed_count += 1
+            if fixed_count > 0:
+                store.save()
+                click.echo(f"\n✓ 已自动修复 {fixed_count} 个可修正问题（负库存置零）")
+
+        if export_path:
+            issue_df = pd.DataFrame([{
+                "严重程度": i.severity,
+                "问题类型": i.issue_type,
+                "数据来源": i.table_name,
+                "记录标识": i.record_key,
+                "详细描述": i.description,
+            } for i in issues])
+            issue_df.to_csv(export_path, index=False, encoding="utf-8-sig")
+            click.echo(f"\n✓ 异常清单已导出到: {export_path}")
+
+        if severity_count.get("高", 0) > 0:
+            click.echo(f"\n⚠ 存在 {severity_count.get('高', 0)} 个高严重程度问题，建议先修复后再进行分析")
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        click.echo(f"✗ 数据质量检查失败: {e}", err=True)
         sys.exit(1)
 
 
@@ -420,12 +994,25 @@ def status_cmd():
     click.echo(f"销量数据: {len(store.sales)} 条记录")
     click.echo(f"库存数据: {len(store.stocks)} 条记录")
     click.echo(f"促销日历: {len(store.promotions)} 条记录")
+    all_store_promos = sum(1 for p in store.promotions if p.is_all_stores)
+    if all_store_promos > 0:
+        click.echo(f"  其中全门店活动: {all_store_promos} 条")
+    click.echo(f"补货策略: {len(store.strategies)} 个模板")
     click.echo(f"预测数据: {len(store.forecasts)} 条记录")
     click.echo(f"补货建议: {len(store.suggestions)} 条记录")
+    click.echo(f"调拨建议: {len(store.transfer_suggestions)} 条记录")
     click.echo("")
     click.echo("=== 参数配置 ===")
     for k, v in store.config.items():
-        click.echo(f"  {k}: {v}")
+        display_v = f"{v:.0%}" if k.endswith("service_level") and isinstance(v, float) else v
+        click.echo(f"  {k}: {display_v}")
+
+    if store.strategies:
+        click.echo("")
+        click.echo("=== 已配置策略 ===")
+        for s in store.strategies.values():
+            scope = s.scope_sku if s.scope_sku else (s.scope_category if s.scope_category else "全部")
+            click.echo(f"  {s.strategy_id}: {s.name} (服务水平{s.service_level:.0%}, 周转{s.target_turnover_days}天, 适用:{scope})")
 
 
 if __name__ == "__main__":

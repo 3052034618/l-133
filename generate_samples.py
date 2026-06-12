@@ -23,11 +23,11 @@ PRODUCTS = [
 
 
 STORES = [
-    ("S001", "南京路旗舰店", "华东区", "上海市黄浦区南京路100号"),
-    ("S002", "陆家嘴店", "华东区", "上海市浦东新区陆家嘴环路200号"),
-    ("S003", "中关村店", "华北区", "北京市海淀区中关村大街300号"),
-    ("S004", "国贸店", "华北区", "北京市朝阳区建国门外大街1号"),
-    ("S005", "天河城店", "华南区", "广州市天河区天河路208号"),
+    ("S001", "南京路旗舰店", "华东区", "旗舰店", "华东核心店群", "上海市黄浦区南京路100号"),
+    ("S002", "陆家嘴店", "华东区", "标准店", "华东核心店群", "上海市浦东新区陆家嘴环路200号"),
+    ("S003", "中关村店", "华北区", "旗舰店", "华北核心店群", "北京市海淀区中关村大街300号"),
+    ("S004", "国贸店", "华北区", "标准店", "华北核心店群", "北京市朝阳区建国门外大街1号"),
+    ("S005", "天河城店", "华南区", "旗舰店", "华南核心店群", "广州市天河区天河路208号"),
 ]
 
 
@@ -45,10 +45,55 @@ def write_stores():
     path = os.path.join(EXAMPLES_DIR, "stores.csv")
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["store_id", "name", "region", "address"])
+        writer.writerow(["store_id", "name", "region", "store_type", "group_name", "address"])
         for s in STORES:
             writer.writerow(s)
     print(f"生成: {path}")
+
+
+def write_strategies():
+    path = os.path.join(EXAMPLES_DIR, "strategies.csv")
+    strategies = [
+        ("STRAT001", "乳制品快周转策略", 0.98, 2, 5, 24, "ceiling", 2.0, "乳制品", "", "短保质期商品，高服务水平"),
+        ("STRAT002", "烘焙新鲜策略", 0.95, 1, 3, 6, "floor", 1.5, "烘焙", "", "当日新鲜，控制周转"),
+        ("STRAT003", "饮料促销策略", 0.90, 3, 14, 24, "ceiling", 1.8, "饮料", "", "大促期间高备货"),
+        ("STRAT004", "日化标准策略", 0.95, 5, 60, 6, "round", 1.5, "日化", "", "长保质期，标准周转"),
+        ("STRAT005", "零食标准策略", 0.95, 3, 30, 12, "ceiling", 1.5, "零食", "", "标准库存策略"),
+        ("STRAT006", "蛋品标准策略", 0.95, 2, 7, 1, "ceiling", 1.5, "蛋品", "", "短保质期"),
+    ]
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["strategy_id", "name", "service_level", "lead_time_days",
+                        "target_turnover_days", "min_order_qty", "order_rounding",
+                        "safety_stock_factor", "scope_category", "scope_sku", "description"])
+        for s in strategies:
+            writer.writerow(s)
+    print(f"生成: {path}")
+
+
+def write_bad_data_samples():
+    bad_sales_path = os.path.join(EXAMPLES_DIR, "bad_sales_sample.csv")
+    with open(bad_sales_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["store_id", "sku", "sale_date", "quantity", "amount"])
+        writer.writerow(["S001", "SKU001", "2026-06-01", -3, 120.0])  # 负销量
+        writer.writerow(["S001", "SKU001", "2026-06-01", 15, 600.0])  # 与上一行重复
+        writer.writerow(["S001", "SKU001", "2026-06-01", 15, 600.0])  # 重复销量
+        writer.writerow(["S999", "SKU001", "2026-06-02", 10, 400.0])  # 缺少门店主数据
+        writer.writerow(["S001", "SKU999", "2026-06-02", 10, 400.0])  # 缺少商品主数据
+        writer.writerow(["S001", "SKU002", "2026/06/03", 10, 400.0])  # 日期格式错误
+        writer.writerow(["S001", "SKU003", "06-03-2026", 10, 400.0])  # 日期格式错误2
+    print(f"生成: {bad_sales_path} (含销量问题数据)")
+
+    bad_stock_path = os.path.join(EXAMPLES_DIR, "bad_stock_sample.csv")
+    with open(bad_stock_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["store_id", "sku", "current_stock", "in_transit", "safety_stock"])
+        writer.writerow(["S001", "SKU001", -5, 10, 50])  # 负库存
+        writer.writerow(["S002", "SKU002", 50, -3, 30])  # 负在途
+        writer.writerow(["S999", "SKU003", 20, 0, 10])  # 缺少门店主数据
+        writer.writerow(["S001", "SKU999", 15, 5, 20])  # 缺少商品主数据
+    print(f"生成: {bad_stock_path} (含库存问题数据)")
 
 
 def write_sales():
@@ -162,7 +207,9 @@ def write_promotions():
 if __name__ == "__main__":
     write_products()
     write_stores()
+    write_strategies()
     write_sales()
     write_stock()
     write_promotions()
+    write_bad_data_samples()
     print(f"\n示例数据已生成到: {EXAMPLES_DIR}")

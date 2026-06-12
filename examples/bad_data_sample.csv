@@ -1,0 +1,5 @@
+﻿store_id,sku,current_stock,in_transit,safety_stock
+S001,SKU001,-5,10,50
+S002,SKU002,50,-3,30
+S999,SKU003,20,0,10
+S001,SKU999,15,5,20
